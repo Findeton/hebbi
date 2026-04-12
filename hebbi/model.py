@@ -224,8 +224,17 @@ class LocalBlock(nn.Module):
         x = x + self.mlp(norm(x))
 
         # Goodness: mean squared activation norm per position
+        # (computed on raw x so it carries real magnitude signal for FF)
         goodness = x.square().mean(dim=-1)  # (B, T)
-        return x, goodness
+
+        # CRITICAL for Forward-Forward stability: normalize the output that
+        # gets passed on to the next block, so downstream blocks only see the
+        # *direction* of this block's activation, not its magnitude. Without
+        # this, FF optimizers discover the degenerate solution of inflating
+        # activations to raise goodness, and training diverges. This is
+        # Hinton's original FF normalization trick.
+        x_out = norm(x)
+        return x_out, goodness
 
 
 class DET(nn.Module):

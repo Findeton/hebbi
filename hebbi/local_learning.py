@@ -189,6 +189,8 @@ def det_train_step(model, pos_ids, neg_ids, layer_opts, config):
         # FF loss for this block
         ff_loss = forward_forward_loss(g_pos, g_neg, threshold)
         ff_loss.backward()
+        # Grad clip to prevent runaway updates (FF is very sensitive to spikes)
+        torch.nn.utils.clip_grad_norm_(block.parameters(), max_norm=1.0)
         layer_opts.step_block(i)
         layer_opts.block_optimizers[i].zero_grad(set_to_none=True)
 
@@ -221,6 +223,11 @@ def det_train_step(model, pos_ids, neg_ids, layer_opts, config):
 
     total_head_loss = lm_loss + 0.1 * emb_loss
     total_head_loss.backward()
+    # Grad clip the head (embedding + lm_head) optimizer too
+    head_params = []
+    for group in layer_opts.head_optimizer.param_groups:
+        head_params.extend(group["params"])
+    torch.nn.utils.clip_grad_norm_(head_params, max_norm=1.0)
     layer_opts.step_head()
 
     losses["lm_loss"] = lm_loss.item()
