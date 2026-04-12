@@ -1,0 +1,14 @@
+[project]
+name = "hebbi"
+version = "0.1.0"
+description = "Decentralized Energy Transformer — biologically-inspired language model without backpropagation"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+]
+
+[project.optional-dependencies]
+logging = ["wandb"]
+
+[tool.setuptools]
+packages = ["hebbi", "scripts"]
