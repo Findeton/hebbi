@@ -134,9 +134,35 @@ memories from multiple conversations.
 
 ### Recurrent Energy Dynamics (energy_steps > 1)
 
-Multiple full passes through all blocks before producing output. The energy landscape
-settles deeper with more iterations — analogous to "System 2" deliberate thinking.
-More iterations at inference = better predictions at the cost of latency.
+Multiple full passes through all blocks before producing output. After block `L-1`
+finishes, its output (a `(B, T, D)` dense tensor, already `norm()`-ed) is fed back
+as the input to block 0 for another traversal. The LM head only fires after the
+final pass — everything stays in continuous representational space, not tokens.
+
+Two levels of iteration compose:
+- `hopfield_steps` — within a single attention head, the query state iterates
+  against fixed K/V. Deepens each head's attractor independently.
+- `energy_steps` — across the full block stack, the entire output loops back.
+  Deepens the network's global energy descent.
+
+Both are inference-time compute knobs that trade latency for capability without
+adding tokens, parameters, or context length.
+
+#### Energy Consolidation Training (Stage 4)
+
+A model pretrained with `energy_steps=1` has never been asked to process its own
+output as its own input. Energy consolidation teaches this explicitly:
+
+1. Run the block stack E times (default 3), accumulating per-block FF gradients
+   across all E passes. Block weights stay fixed within one training iteration
+   (matching inference).
+2. Weight each pass's gradient contribution with normalized per-stage weights
+   (default: increasing — later passes get more weight).
+3. Step each block optimizer once after all passes finish.
+
+The LM head sees only the final pass's output. This trains the representational
+space to be self-consistent under iteration — the model learns that producing
+a useful refinement of its own output is rewarded by the FF objective.
 
 ### GradMem (Test-Time Memory Adaptation)
 
@@ -238,12 +264,13 @@ hebbi/
 │   ├── common.py           # Device detection, COMPUTE_DTYPE, DDP utilities
 │   ├── data.py             # BPE tokenizer, HF dataset streaming, SFT data loading
 │   ├── model.py            # DETConfig, EnergyAttention, HopfieldMemoryBank, LocalBlock, DET
-│   └── local_learning.py   # FF loss, negative gen, LayerOptimizers, online learning
+│   └── local_learning.py   # FF loss, negative gen, LayerOptimizers, energy training, online learning
 ├── scripts/
 │   ├── train.py            # Pretrain (TinyStories / ClimbMix) with resume
 │   ├── train_sft.py        # SFT on conversation data (SmolTalk)
-│   ├── train_memory.py     # Memory gate training (stage 4)
-│   ├── run_pipeline.py     # Resumable 4-stage training pipeline
+│   ├── train_energy.py     # Energy consolidation (stage 4, energy_steps > 1)
+│   ├── train_memory.py     # Memory gate training (stage 5)
+│   ├── run_pipeline.py     # Resumable 5-stage training pipeline
 │   ├── generate.py         # Text generation from checkpoint
 │   └── chat.py             # Interactive chat with two-speed online learning
 ├── ARCHITECTURE.md         # This document

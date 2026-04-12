@@ -20,7 +20,8 @@ parser.add_argument("--prompt", type=str, default=None)
 parser.add_argument("--max-tokens", type=int, default=500)
 parser.add_argument("--temperature", type=float, default=0.8)
 parser.add_argument("--top-k", type=int, default=40)
-parser.add_argument("--energy-steps", type=int, default=None, help="override thinking iterations")
+parser.add_argument("--energy-steps", type=int, default=None, help="override max thinking iterations")
+parser.add_argument("--energy-threshold", type=float, default=None, help="convergence threshold (0=always run all steps)")
 parser.add_argument("--device-type", type=str, default="")
 args = parser.parse_args()
 
@@ -32,6 +33,8 @@ checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False
 config = DETConfig(**checkpoint["config"])
 if args.energy_steps is not None:
     config.energy_steps = args.energy_steps
+if args.energy_threshold is not None:
+    config.energy_threshold = args.energy_threshold
 
 model = DET(config).to(device)
 model.load_state_dict(checkpoint["model"], strict=False)

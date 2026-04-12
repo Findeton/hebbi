@@ -236,6 +236,166 @@ def det_train_step(model, pos_ids, neg_ids, layer_opts, config):
 
 
 # ---------------------------------------------------------------------------
+# Energy-consolidated training step
+# ---------------------------------------------------------------------------
+
+def compute_energy_weights(energy_steps, mode="increasing", custom_weights=None):
+    """
+    Compute normalized per-stage weights for energy-consolidated training.
+
+    Args:
+        energy_steps: number of energy iterations
+        mode: "increasing" | "uniform" | "decreasing" | "final_only" | "custom"
+        custom_weights: list of floats (required when mode="custom")
+
+    Returns:
+        list of normalized weights (sum to 1.0)
+    """
+    if mode == "custom":
+        assert custom_weights is not None and len(custom_weights) == energy_steps
+        raw = list(custom_weights)
+    elif mode == "uniform":
+        raw = [1.0] * energy_steps
+    elif mode == "increasing":
+        # Linear ramp: 1, 2, 3, ... E
+        raw = [float(e + 1) for e in range(energy_steps)]
+    elif mode == "decreasing":
+        # Inverse ramp: E, E-1, ..., 1
+        raw = [float(energy_steps - e) for e in range(energy_steps)]
+    elif mode == "final_only":
+        raw = [0.0] * (energy_steps - 1) + [1.0]
+    else:
+        raise ValueError(f"Unknown energy_weights mode: {mode}")
+
+    total = sum(raw)
+    if total == 0:
+        return [0.0] * energy_steps
+    return [w / total for w in raw]
+
+
+def det_train_step_with_energy(model, pos_ids, neg_ids, layer_opts, config,
+                                energy_weights):
+    """
+    Forward-Forward training with recurrent energy dynamics.
+
+    The block stack is traversed energy_steps times. Each pass contributes
+    gradients weighted by energy_weights[e] to the SAME block parameters.
+    Optimizers step exactly once after the final pass, so block weights stay
+    fixed across energy stages within one training iteration — matching
+    inference behavior.
+
+    Args:
+        model: DET model
+        pos_ids: (B, T) positive (real) token ids
+        neg_ids: (B, T) negative (corrupted) token ids
+        layer_opts: LayerOptimizers instance
+        config: DETConfig
+        energy_weights: list of E floats — per-stage gradient weights (should
+                        be normalized so sum ≈ 1.0)
+    """
+    layer_opts.zero_all()
+    losses = {}
+    threshold = config.ff_threshold
+    E = len(energy_weights)
+    n_layer = len(model.blocks)
+
+    # Initial state: embedding (no grad for embedding in block phase)
+    with torch.no_grad():
+        x_pos = norm(model.wte(pos_ids).to(COMPUTE_DTYPE))
+        x_neg = norm(model.wte(neg_ids).to(COMPUTE_DTYPE))
+    cos_sin = model._get_cos_sin(pos_ids.size(1))
+
+    for e in range(E):
+        w_e = energy_weights[e]
+        x_pos_prev = x_pos
+        history_pos = [x_pos]
+        history_neg = [x_neg]
+
+        for i, block in enumerate(model.blocks):
+            det_hist_pos = [h.detach() for h in history_pos]
+            det_hist_neg = [h.detach() for h in history_neg]
+
+            out_pos, g_pos = block(det_hist_pos[-1], cos_sin,
+                                   history=det_hist_pos)
+            out_neg, g_neg = block(det_hist_neg[-1], cos_sin,
+                                   history=det_hist_neg)
+
+            ff_loss = forward_forward_loss(g_pos, g_neg, threshold)
+
+            # Accumulate weighted gradients — no optimizer step yet
+            if w_e > 0:
+                (w_e * ff_loss).backward()
+
+            history_pos.append(out_pos.detach())
+            history_neg.append(out_neg.detach())
+
+            losses[f"ff_{i}_e{e}"] = ff_loss.item()
+            losses[f"goodness_pos_{i}_e{e}"] = g_pos.mean().item()
+            losses[f"goodness_neg_{i}_e{e}"] = g_neg.mean().item()
+
+        # Feed final output back as next energy stage's input
+        x_pos = history_pos[-1]
+        x_neg = history_neg[-1]
+
+        # Convergence diagnostics (no extra gradients, just logging)
+        with torch.no_grad():
+            # Per-stage LM loss: would stopping here give good predictions?
+            stage_logits = model.lm_head(norm(x_pos)).float()
+            stage_lm = F.cross_entropy(
+                stage_logits[:, :-1].reshape(-1, config.vocab_size),
+                pos_ids[:, 1:].reshape(-1),
+            )
+            losses[f"lm_loss_e{e}"] = stage_lm.item()
+
+            # Representation delta (how much changed this pass)
+            if e > 0:
+                delta = (x_pos - x_pos_prev).square().mean().item()
+                losses[f"energy_delta_e{e}"] = delta
+
+    # --- Single optimizer step per block, AFTER all energy stages ---
+    for i, block in enumerate(model.blocks):
+        torch.nn.utils.clip_grad_norm_(block.parameters(), max_norm=1.0)
+        layer_opts.step_block(i)
+        layer_opts.block_optimizers[i].zero_grad(set_to_none=True)
+
+    # --- LM head: trains only on the FINAL energy stage's output ---
+    logits = model.lm_head(norm(x_pos)).float()
+    targets = pos_ids[:, 1:]
+    lm_loss = F.cross_entropy(
+        logits[:, :-1].reshape(-1, config.vocab_size),
+        targets.reshape(-1),
+    )
+
+    emb_for_train = norm(model.wte(pos_ids).to(COMPUTE_DTYPE))
+    emb_logits = model.lm_head(emb_for_train).float()
+    emb_loss = F.cross_entropy(
+        emb_logits[:, :-1].reshape(-1, config.vocab_size),
+        targets.reshape(-1),
+    )
+
+    total_head_loss = lm_loss + 0.1 * emb_loss
+    total_head_loss.backward()
+    head_params = []
+    for group in layer_opts.head_optimizer.param_groups:
+        head_params.extend(group["params"])
+    torch.nn.utils.clip_grad_norm_(head_params, max_norm=1.0)
+    layer_opts.step_head()
+
+    losses["lm_loss"] = lm_loss.item()
+    losses["emb_loss"] = emb_loss.item()
+
+    # Aggregate per-block across energy stages for convenience
+    for i in range(n_layer):
+        losses[f"ff_{i}"] = sum(
+            losses[f"ff_{i}_e{e}"] for e in range(E)
+        ) / E
+        losses[f"goodness_pos_{i}"] = losses[f"goodness_pos_{i}_e{E-1}"]
+        losses[f"goodness_neg_{i}"] = losses[f"goodness_neg_{i}_e{E-1}"]
+
+    return losses
+
+
+# ---------------------------------------------------------------------------
 # Online learning with reward modulation
 # ---------------------------------------------------------------------------
 

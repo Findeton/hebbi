@@ -31,7 +31,8 @@ class DETConfig:
     hopfield_beta: float = 1.0  # inverse temperature for energy attention
     hopfield_steps: int = 3     # convergence iterations per attention
     ff_threshold: float = 2.0   # Forward-Forward goodness threshold
-    energy_steps: int = 1       # recurrent thinking iterations (Phase 2)
+    energy_steps: int = 1       # max recurrent thinking iterations
+    energy_threshold: float = 0.01  # convergence threshold for early stopping (0 = always run all steps)
     n_mem: int = 0              # GradMem prefix tokens, 0 = disabled (Phase 2)
     corruption_rate: float = 0.15  # fraction of tokens corrupted for negatives
 
@@ -464,9 +465,24 @@ class DET(nn.Module):
             x = torch.cat([mem, x], dim=1)
             cos_sin = self._get_cos_sin(x.size(1))
 
-        # Recurrent energy dynamics: multiple passes (Phase 2)
+        # Recurrent energy dynamics: iterate until convergence or max steps.
+        # Like an attractor network — the state evolves until it settles.
+        # Easy inputs converge in one pass, hard inputs need more.
+        self._last_energy_iters = 0
+        self._last_energy_delta = 0.0
         for energy_iter in range(self.config.energy_steps):
+            x_prev = x
             x, _ = self.forward_blocks(x, cos_sin, return_goodness=False)
+            self._last_energy_iters = energy_iter + 1
+
+            # Convergence check: stop when representation has settled.
+            # Only during inference — training always runs all steps for
+            # consistent gradient accumulation.
+            if energy_iter > 0 and self.config.energy_threshold > 0:
+                delta = (x - x_prev).square().mean().item()
+                self._last_energy_delta = delta
+                if not self.training and delta < self.config.energy_threshold:
+                    break
 
         # Remove memory prefix
         if self.config.n_mem > 0 and hasattr(self, "memory"):

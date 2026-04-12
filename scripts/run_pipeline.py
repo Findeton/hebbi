@@ -1,10 +1,12 @@
 """
 Hebbi training pipeline runner — resumable end-to-end training.
 
-Runs all three stages in sequence:
-    1. TinyStories pretrain (20k steps)
-    2. ClimbMix pretrain   (50k steps, weights initialized from stage 1)
-    3. SmolTalk SFT         (3k steps, from stage 2)
+Runs all stages in sequence:
+    1. TinyStories pretrain       (20k steps)
+    2. ClimbMix pretrain          (50k steps, weights initialized from stage 1)
+    3. SmolTalk SFT               (3k steps, from stage 2)
+    4. Energy consolidation       (2k steps, from stage 3, energy_steps=3)
+    5. Memory gate training       (1k steps, from stage 4)
 
 Resumable: if the script is stopped (Ctrl+C, pod restart, crash, etc.),
 just re-run it. It:
@@ -122,10 +124,32 @@ STAGES = [
         ],
     },
     {
+        "name": "energy",
+        "script": "scripts.train_energy",
+        "num_iterations": 2000,
+        "init_from": "sft",
+        "checkpoint_flag": "--checkpoint",
+        "final_name": "hebbi_energy_final.pt",
+        "checkpoint_prefix": "hebbi_energy_",
+        "args": [
+            "--dataset=smoltalk",
+            "--batch-size=4",
+            "--num-iterations=2000",
+            "--energy-steps=3",
+            "--energy-weight-mode=increasing",
+            "--block-lr=1e-4",
+            "--head-lr=1e-4",
+            "--embed-lr=3e-4",
+            "--warmup-steps=100",
+            "--save-every=500",
+            "--sample-every=500",
+        ],
+    },
+    {
         "name": "memory",
         "script": "scripts.train_memory",
         "num_iterations": 1000,
-        "init_from": "sft",
+        "init_from": "energy",
         "checkpoint_flag": "--checkpoint",
         "final_name": "hebbi_memory_final.pt",
         "checkpoint_prefix": "hebbi_memory_",

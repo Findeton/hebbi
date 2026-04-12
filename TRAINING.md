@@ -38,8 +38,8 @@ python -m scripts.train \
 
 ## One-Command Pipeline (Resumable)
 
-For the full TinyStories → ClimbMix → SmolTalk SFT run, use
-[scripts/run_pipeline.py](scripts/run_pipeline.py). It runs all three stages in
+For the full TinyStories → ClimbMix → SFT → Energy → Memory run, use
+[scripts/run_pipeline.py](scripts/run_pipeline.py). It runs all five stages in
 sequence, each in its own directory under `/workspace/runs/`, and is fully
 resumable — if the pod restarts or you Ctrl+C, just re-run the same command.
 
@@ -86,6 +86,7 @@ python scripts/run_pipeline.py
 - `/workspace/runs/stage_tinystories/checkpoints/hebbi_final.pt`
 - `/workspace/runs/stage_climbmix/checkpoints/hebbi_final.pt`
 - `/workspace/runs/stage_sft/checkpoints/hebbi_sft_final.pt`
+- `/workspace/runs/stage_energy/checkpoints/hebbi_energy_final.pt`
 - `/workspace/runs/stage_memory/checkpoints/hebbi_memory_final.pt` ← the chatbot (with trained memory gates)
 
 ### GPU memory tuning
@@ -145,7 +146,37 @@ python -m scripts.train_sft \
     --run=hebbi_sft
 ```
 
-### Stage 4: Memory Gate Training
+### Stage 4: Energy Consolidation
+
+Teach the model to use recurrent energy dynamics (`energy_steps > 1`). The model
+was pretrained with `energy_steps=1`, so it has never processed its own output as
+its own input. Energy consolidation trains the representational space to be
+self-consistent under iteration:
+
+```bash
+python -m scripts.train_energy \
+    --checkpoint=checkpoints/hebbi_sft_final.pt \
+    --energy-steps=3 \
+    --energy-weight-mode=increasing \
+    --num-iterations=2000 \
+    --run=hebbi_energy
+```
+
+Each training step runs the block stack 3 times, accumulating per-block FF gradients
+across all passes (weighted by the per-stage weights). Optimizers step once at the
+end, so block weights stay fixed within one iteration — matching inference behavior.
+
+Per-stage weight modes:
+- `increasing` (default): later passes get more gradient weight (normalized: `[0.17, 0.33, 0.50]`)
+- `uniform`: equal weights across passes
+- `decreasing`: first pass emphasized
+- `final_only`: only the last pass contributes gradients
+- `custom`: pass `--energy-weights-custom=0.2,0.3,0.5` for manual control
+
+After energy consolidation, `energy_steps > 1` at inference should improve output
+quality — the model has been explicitly trained to benefit from iterative refinement.
+
+### Stage 5: Memory Gate Training
 
 Train each block's memory gate to integrate Hopfield memory bank retrievals.
 Each step: forward a context batch → Hebbian write to banks → train on a separate
@@ -153,7 +184,7 @@ target batch → clear banks. The gate learns to open when retrieved memories he
 
 ```bash
 python -m scripts.train_memory \
-    --checkpoint=checkpoints/hebbi_sft_final.pt \
+    --checkpoint=checkpoints/hebbi_energy_final.pt \
     --dataset=smoltalk \
     --num-iterations=1000 \
     --run=hebbi_memory
@@ -162,7 +193,7 @@ python -m scripts.train_memory \
 Gate values start near 0.047 (sigmoid(-3)) and open during training as the model
 learns to use retrieved memories.
 
-### Stage 5: Chat with Two-Speed Online Learning
+### Stage 6: Chat with Two-Speed Online Learning
 
 ```bash
 python -m scripts.chat \
@@ -191,6 +222,8 @@ python -m scripts.chat \
 | `--head-lr` | 1e-3 | LM head learning rate |
 | `--embed-lr` | 1e-2 | Embedding learning rate |
 | `--grad-accum` | 1 | Gradient accumulation steps |
+| `--energy-steps` | 1 (3 for energy stage) | Recurrent energy iterations per training step |
+| `--energy-weight-mode` | increasing | Per-stage gradient weighting: increasing/uniform/decreasing/final_only/custom |
 
 ## Checkpoints
 
