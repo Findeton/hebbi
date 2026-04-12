@@ -5,6 +5,8 @@ description = "Decentralized Energy Transformer — biologically-inspired langua
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
+    "tokenizers>=0.15",
+    "datasets>=2.14",
 ]
 
 [project.optional-dependencies]

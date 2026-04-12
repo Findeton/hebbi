@@ -229,6 +229,59 @@ def det_train_step(model, pos_ids, neg_ids, layer_opts, config):
 
 
 # ---------------------------------------------------------------------------
+# Online learning with reward modulation
+# ---------------------------------------------------------------------------
+
+def online_learn_step(model, conversation_ids, layer_opts, config, reward=0.0):
+    """
+    Online Forward-Forward learning from a single conversation.
+
+    The reward signal modulates learning like a neuromodulatory signal (dopamine):
+      +1 (user said "good") -> conversation is strongly positive, stronger update
+      -1 (user said "bad")  -> conversation becomes NEGATIVE example (swap pos/neg)
+       0 (neutral/default)  -> mild learning, conversation is weakly positive
+
+    Args:
+        model: DET model
+        conversation_ids: (1, T) tensor of token ids
+        layer_opts: LayerOptimizers instance
+        config: DETConfig
+        reward: float in [-1, 1], modulates learning
+    """
+    pos_ids = conversation_ids
+    neg_ids = generate_negatives(pos_ids, config.vocab_size, config.corruption_rate)
+
+    if reward < 0:
+        # User said "bad" — the actual response becomes a negative example
+        pos_ids, neg_ids = neg_ids, pos_ids
+
+    # Scale learning rate by reward magnitude
+    lr_scale = max(0.1, abs(reward)) if reward != 0 else 0.3
+
+    # Temporarily scale LRs
+    saved_lrs = []
+    all_opts = layer_opts.block_optimizers + [layer_opts.head_optimizer]
+    for opt in all_opts:
+        opt_lrs = []
+        for g in opt.param_groups:
+            opt_lrs.append(g["lr"])
+            g["lr"] = g["lr"] * lr_scale
+        saved_lrs.append(opt_lrs)
+
+    # Run FF training step
+    losses = det_train_step(model, pos_ids, neg_ids, layer_opts, config)
+
+    # Restore LRs
+    for opt, opt_lrs in zip(all_opts, saved_lrs):
+        for g, lr in zip(opt.param_groups, opt_lrs):
+            g["lr"] = lr
+
+    losses["reward"] = reward
+    losses["lr_scale"] = lr_scale
+    return losses
+
+
+# ---------------------------------------------------------------------------
 # GradMem test-time adaptation (Phase 2)
 # ---------------------------------------------------------------------------
 
@@ -242,33 +295,46 @@ def adapt_memory(model, context_ids, n_steps=5, lr=0.01):
     """
     assert model.config.n_mem > 0, "Model has no memory tokens (n_mem=0)"
 
+    B, T = context_ids.shape
+
     # Clone memory for this adaptation session
     mem = model.memory.data.clone().requires_grad_(True)
     opt = torch.optim.Adam([mem], lr=lr)
 
-    for _ in range(n_steps):
-        opt.zero_grad()
-        B, T = context_ids.shape
-        emb = norm(model.wte(context_ids).to(COMPUTE_DTYPE))
-        # Prepend memory
-        x = torch.cat([mem.expand(B, -1, -1).to(emb.dtype), emb], dim=1)
-        cos_sin = model._get_cos_sin(x.size(1))
+    # Freeze all model parameters so only mem gets updated
+    # (no_grad would break the computation graph to mem)
+    saved_requires_grad = {}
+    for name, p in model.named_parameters():
+        saved_requires_grad[name] = p.requires_grad
+        p.requires_grad_(False)
 
-        # Forward through blocks (frozen)
-        with torch.no_grad():
+    try:
+        for _ in range(n_steps):
+            opt.zero_grad()
+            emb = norm(model.wte(context_ids).to(COMPUTE_DTYPE))
+            # Prepend memory — mem keeps gradient flow
+            x = torch.cat([mem.expand(B, -1, -1).to(emb.dtype), emb], dim=1)
+            cos_sin = model._get_cos_sin(x.size(1))
+
+            # Forward through blocks — activations flow through so
+            # gradients can reach mem, but block params are frozen
             for block in model.blocks:
                 x, _ = block(x, cos_sin)
 
-        # Reconstruction loss on context portion
-        x_ctx = x[:, model.config.n_mem :, :]
-        logits = model.lm_head(norm(x_ctx)).float()
-        targets = context_ids[:, 1:]
-        loss = F.cross_entropy(
-            logits[:, :-1].reshape(-1, model.config.vocab_size),
-            targets.reshape(-1),
-        )
-        loss.backward()
-        opt.step()
+            # Reconstruction loss on context portion
+            x_ctx = x[:, model.config.n_mem :, :]
+            logits = model.lm_head(norm(x_ctx)).float()
+            targets = context_ids[:, 1:]
+            loss = F.cross_entropy(
+                logits[:, :-1].reshape(-1, model.config.vocab_size),
+                targets.reshape(-1),
+            )
+            loss.backward()
+            opt.step()
+    finally:
+        # Restore requires_grad state
+        for name, p in model.named_parameters():
+            p.requires_grad_(saved_requires_grad[name])
 
     # Install adapted memory
     model.memory.data.copy_(mem.data)

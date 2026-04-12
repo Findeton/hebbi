@@ -23,17 +23,24 @@ from hebbi.common import COMPUTE_DTYPE
 
 @dataclass
 class DETConfig:
-    sequence_len: int = 256
-    vocab_size: int = 65        # Shakespeare character set
-    n_layer: int = 6
-    n_embd: int = 256
-    n_head: int = 4
+    sequence_len: int = 1024
+    vocab_size: int = 50304     # GPT-2 BPE (50257) padded to multiple of 64
+    n_layer: int = 12
+    n_embd: int = 768
+    n_head: int = 6
     hopfield_beta: float = 1.0  # inverse temperature for energy attention
     hopfield_steps: int = 3     # convergence iterations per attention
     ff_threshold: float = 2.0   # Forward-Forward goodness threshold
     energy_steps: int = 1       # recurrent thinking iterations (Phase 2)
     n_mem: int = 0              # GradMem prefix tokens, 0 = disabled (Phase 2)
     corruption_rate: float = 0.15  # fraction of tokens corrupted for negatives
+
+    @classmethod
+    def from_depth(cls, depth, aspect_ratio=64, head_dim=128, **kwargs):
+        """Single-dial config: depth controls model size (same pattern as nanochat)."""
+        n_embd = ((depth * aspect_ratio + head_dim - 1) // head_dim) * head_dim
+        n_head = n_embd // head_dim
+        return cls(n_layer=depth, n_embd=n_embd, n_head=n_head, **kwargs)
 
 
 def norm(x):
