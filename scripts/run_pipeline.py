@@ -121,6 +121,26 @@ STAGES = [
             "--sample-every=500",
         ],
     },
+    {
+        "name": "memory",
+        "script": "scripts.train_memory",
+        "num_iterations": 1000,
+        "init_from": "sft",
+        "checkpoint_flag": "--checkpoint",
+        "final_name": "hebbi_memory_final.pt",
+        "checkpoint_prefix": "hebbi_memory_",
+        "args": [
+            "--dataset=smoltalk",
+            "--batch-size=4",
+            "--num-iterations=1000",
+            "--block-lr=3e-4",
+            "--head-lr=3e-4",
+            "--embed-lr=1e-3",
+            "--warmup-steps=50",
+            "--save-every=500",
+            "--sample-every=500",
+        ],
+    },
 ]
 
 STAGE_BY_NAME = {s["name"]: s for s in STAGES}

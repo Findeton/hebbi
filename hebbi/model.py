@@ -182,13 +182,91 @@ class AttentionResidual(nn.Module):
         return x
 
 
+class HopfieldMemoryBank(nn.Module):
+    """
+    Persistent associative memory using Hebbian outer-product storage.
+
+    Stores memories as superimposed key-value patterns in a weight matrix,
+    following the Modern Hopfield Network framework. Each block has its own
+    private bank — other blocks see retrieved memories only indirectly
+    through the attention residual pathway.
+
+    Write: W = decay * W + v ⊗ k     (Hebbian — no gradients)
+    Read:  retrieved = gate * W @ norm(x) / sqrt(n_writes)
+
+    The gate parameter is learned via FF loss during memory training (stage 4).
+    During stages 1-3 the banks are empty, so read() returns zeros and the
+    gate receives zero gradients — training is completely unaffected.
+
+    Capacity: ~D patterns before significant interference (D=768 → ~768
+    conversation memories per block). Old memories decay exponentially.
+    """
+
+    def __init__(self, n_embd, gate_init=-3.0, decay=0.99):
+        super().__init__()
+        self.n_embd = n_embd
+        self.decay = decay
+        # Weight matrix — written via Hebbian rule, not by gradient
+        self.register_buffer("W", torch.zeros(n_embd, n_embd))
+        self.register_buffer("n_writes", torch.tensor(0, dtype=torch.long))
+        # Learned gate: sigmoid(-3) ≈ 0.05 → nearly off at init
+        self.gate = nn.Parameter(torch.tensor(gate_init))
+
+    def read(self, x):
+        """x: (B, T, D) → (B, T, D) retrieved memory."""
+        if self.n_writes.item() == 0:
+            return torch.zeros_like(x)
+        x_norm = norm(x)
+        retrieved = F.linear(x_norm, self.W.to(x.dtype))  # (B, T, D)
+        # Scale by 1/sqrt(n_writes) to keep magnitude stable as bank fills
+        retrieved = retrieved * torch.rsqrt(self.n_writes.float().clamp(min=1))
+        return torch.sigmoid(self.gate) * retrieved
+
+    @torch.no_grad()
+    def write(self, key, value, reward=0.0):
+        """
+        Reward-modulated Hebbian write: W = decay * W + strength * outer(v, k).
+
+        Dopamine-like modulation:
+          reward=+1 → strength=1.0  (strong LTP — remember this)
+          reward= 0 → strength=0.3  (mild write — default)
+          reward=-1 → strength=-0.4 (anti-Hebbian LTD — suppress this pattern)
+
+        key:   (B, T, D) or (D,) — what the block was looking at (query cue)
+        value: (B, T, D) or (D,) — what the block computed (useful content)
+        reward: float in [-1, 1] — modulates write strength
+        """
+        # Dopamine-modulated strength: maps [-1, 1] → [-0.4, 1.0]
+        strength = 0.3 + 0.7 * reward
+
+        if key.dim() == 3:
+            k = norm(key.float().mean(dim=(0, 1)))   # (D,)
+            v = value.float().mean(dim=(0, 1))        # (D,)
+        elif key.dim() == 2:
+            k = norm(key.float().mean(dim=0))
+            v = value.float().mean(dim=0)
+        else:
+            k = norm(key.float())
+            v = value.float()
+        self.W.mul_(self.decay).add_(torch.outer(v, k), alpha=strength)
+        self.n_writes.add_(1)
+
+    @torch.no_grad()
+    def clear(self):
+        """Reset the bank to empty state."""
+        self.W.zero_()
+        self.n_writes.zero_()
+
+
 class LocalBlock(nn.Module):
     """
-    A semi-autonomous block with energy attention, MLP, and attention residuals.
+    A semi-autonomous block with energy attention, MLP, Hopfield memory,
+    and attention residuals.
 
     Each block:
     - Selects its input via attention residuals (dynamic routing from all prior blocks)
     - Processes via energy-based attention + MLP
+    - Reads from its persistent Hopfield memory bank
     - Reports goodness for Forward-Forward training
     - Learns independently with its own optimizer
     """
@@ -197,6 +275,7 @@ class LocalBlock(nn.Module):
         self.layer_idx = layer_idx
         self.attn = EnergyAttention(config)
         self.mlp = MLP(config)
+        self.memory_bank = HopfieldMemoryBank(config.n_embd)
         # Attention residual: dynamic routing from preceding blocks
         # (not needed for block 0 — it just uses the embedding directly)
         if layer_idx > 0:
@@ -219,8 +298,9 @@ class LocalBlock(nn.Module):
         if self.attn_resid is not None and history is not None and len(history) > 0:
             x = self.attn_resid(history)
 
-        # Attention + MLP with residual connections (within-block only)
+        # Attention + MLP + Memory with residual connections (within-block only)
         x = x + self.attn(norm(x), cos_sin)
+        x = x + self.memory_bank.read(x)
         x = x + self.mlp(norm(x))
 
         # Goodness: mean squared activation norm per position
@@ -339,6 +419,35 @@ class DET(nn.Module):
             history.append(output if not return_goodness else output.detach())
 
         return history[-1], goodness_list
+
+    def forward_and_collect(self, idx):
+        """
+        Forward pass that returns per-block (input, output) pairs.
+        Used by memory training to populate banks with Hebbian writes.
+        """
+        B, T = idx.size()
+        cos_sin = self._get_cos_sin(T)
+        x = norm(self.wte(idx).to(COMPUTE_DTYPE))
+
+        block_ios = []  # list of (input, output) per block
+        history = [x]
+        for block in self.blocks:
+            block_input = history[-1]
+            output, _ = block(block_input, cos_sin, history=history)
+            block_ios.append((block_input.detach(), output.detach()))
+            history.append(output.detach())
+        return block_ios
+
+    def write_to_banks(self, block_ios, reward=0.0):
+        """Write per-block (input, output) pairs into memory banks."""
+        for i, block in enumerate(self.blocks):
+            key, value = block_ios[i]
+            block.memory_bank.write(key, value, reward=reward)
+
+    def clear_banks(self):
+        """Clear all memory banks."""
+        for block in self.blocks:
+            block.memory_bank.clear()
 
     def forward(self, idx, targets=None):
         """Full forward pass for inference/eval."""

@@ -85,7 +85,8 @@ python scripts/run_pipeline.py
 
 - `/workspace/runs/stage_tinystories/checkpoints/hebbi_final.pt`
 - `/workspace/runs/stage_climbmix/checkpoints/hebbi_final.pt`
-- `/workspace/runs/stage_sft/checkpoints/hebbi_sft_final.pt` ← the chatbot
+- `/workspace/runs/stage_sft/checkpoints/hebbi_sft_final.pt`
+- `/workspace/runs/stage_memory/checkpoints/hebbi_memory_final.pt` ← the chatbot (with trained memory gates)
 
 ### GPU memory tuning
 
@@ -140,15 +141,32 @@ Fine-tune on conversations with loss masking (only assistant tokens):
 python -m scripts.train_sft \
     --checkpoint=checkpoints/hebbi_final.pt \
     --dataset=smoltalk \
-    --num-iterations=2000 \
+    --num-iterations=3000 \
     --run=hebbi_sft
 ```
 
-### Stage 4: Chat with Online Learning
+### Stage 4: Memory Gate Training
+
+Train each block's memory gate to integrate Hopfield memory bank retrievals.
+Each step: forward a context batch → Hebbian write to banks → train on a separate
+target batch → clear banks. The gate learns to open when retrieved memories help:
+
+```bash
+python -m scripts.train_memory \
+    --checkpoint=checkpoints/hebbi_sft_final.pt \
+    --dataset=smoltalk \
+    --num-iterations=1000 \
+    --run=hebbi_memory
+```
+
+Gate values start near 0.047 (sigmoid(-3)) and open during training as the model
+learns to use retrieved memories.
+
+### Stage 5: Chat with Two-Speed Online Learning
 
 ```bash
 python -m scripts.chat \
-    --checkpoint=checkpoints/hebbi_sft_final.pt \
+    --checkpoint=checkpoints/hebbi_memory_final.pt \
     --online-learning
 ```
 
@@ -156,7 +174,7 @@ With GradMem for forgetting protection:
 
 ```bash
 python -m scripts.chat \
-    --checkpoint=checkpoints/hebbi_sft_final.pt \
+    --checkpoint=checkpoints/hebbi_memory_final.pt \
     --online-learning \
     --n-mem=16
 ```
@@ -188,15 +206,56 @@ Resume training:
 python -m scripts.train --dataset=climbmix --depth=12 --resume=checkpoints/hebbi_005000.pt
 ```
 
-## Online Learning
+## Two-Speed Online Learning
 
-During chat, user feedback modulates the Forward-Forward learning signal:
+Chat mode implements two learning speeds, inspired by hippocampal-neocortical memory consolidation:
 
-- **good/g**: Response becomes a strongly positive example (reward=+1)
-- **bad/b**: Response becomes a negative example — the model learns "this is NOT good text" (reward=-1)
-- **[Enter]**: Mild neutral update (reward=0)
+### Fast Path (Every Turn) — Hebbian Memory Banks
 
-This is analogous to dopamine modulation in biological neural circuits.
+After each response, the model performs a reward-modulated Hebbian write to all blocks'
+memory banks. This is instant (~0ms, no gradients):
+
+- **good/g** (reward=+1): Strong LTP write — strengthens the association
+- **bad/b** (reward=-1): Anti-Hebbian LTD write — actively suppresses the pattern
+- **[Enter]** (reward=0): Mild neutral write (strength=0.3)
+
+The reward acts as a dopamine-like neuromodulatory signal. Each write is a single
+outer product per block — biologically plausible and computationally free.
+
+### Slow Path (`/sleep`) — FF Weight Consolidation
+
+The `/sleep` command replays logged episodes through full Forward-Forward training,
+baking episodic (Hebbian) memories into permanent model weights:
+
+```
+/sleep
+```
+
+How it works:
+1. Replays all logged episodes (with recency-weighted sampling)
+2. For each episode: Hebbian write to banks (restore context) → FF weight update
+3. Uses the original reward signal from each episode
+4. Clears banks after sleep (fresh start)
+5. Configurable: `--sleep-epochs=3` (default)
+
+Episodes persist across sessions in `.episodes.jsonl` files next to the checkpoint,
+so `/sleep` can consolidate memories from multiple conversations.
+
+### Episode Logging
+
+Every conversation turn is logged with its reward and timestamp to
+`<checkpoint>.episodes.jsonl`. This enables:
+- Cross-session memory consolidation via `/sleep`
+- Replay with original rewards (not re-evaluated)
+- Recency bias: recent episodes are replayed more often
+
+### Save on Exit
+
+If any learning occurred (Hebbian writes or /sleep), the model is saved to
+`<checkpoint>.chat.pt` on exit. Resume with:
+```bash
+python -m scripts.chat --checkpoint=checkpoints/hebbi_memory_final.chat.pt --online-learning
+```
 
 ## GradMem (Forgetting Protection)
 

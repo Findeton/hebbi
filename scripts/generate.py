@@ -34,7 +34,7 @@ if args.energy_steps is not None:
     config.energy_steps = args.energy_steps
 
 model = DET(config).to(device)
-model.load_state_dict(checkpoint["model"])
+model.load_state_dict(checkpoint["model"], strict=False)
 model.eval()
 
 # Detect if this is a char-level or BPE model

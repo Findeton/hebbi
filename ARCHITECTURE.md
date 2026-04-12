@@ -77,7 +77,60 @@ The embedding and LM head train via a separate local next-character prediction l
 
 ---
 
-## Phase 2: Continuous Learning & Memory
+## Phase 2: Continuous Learning & Memory (Current Implementation)
+
+### Hopfield Memory Banks (Hebbian Weight Matrix)
+
+Each block has a persistent memory bank — a learned associative matrix `W ∈ R^{D×D}`
+that stores and retrieves episodic memories via reward-modulated Hebbian writes.
+
+```
+Write:  W ← decay·W + strength · outer(value, key)
+Read:   retrieved = sigmoid(gate) · (W @ norm(x)) / sqrt(n_writes)
+```
+
+Key properties:
+- **No gradients needed** for writes — pure outer-product Hebbian update (~0ms)
+- **Reward-modulated**: `strength = 0.3 + 0.7 * reward` maps reward ∈ [-1, 1] to strength ∈ [-0.4, 1.0]
+  - reward=+1 (LTP): strong write, strengthens the association
+  - reward=0 (neutral): mild write (strength=0.3)
+  - reward=-1 (LTD): anti-Hebbian, actively suppresses the pattern
+- **Learnable gate** per block: initialized closed (sigmoid(-3) ≈ 0.047), opens via FF gradients during memory training
+- **Decay** (0.99): older memories fade, preventing unbounded growth
+- **Scaling** by `1/sqrt(n_writes)`: prevents magnitude explosion as memories accumulate
+
+The gate parameter is the only part that needs gradients — it learns during memory
+training (stage 4) whether retrieved memories help each block's FF objective.
+
+### Three Memory Timescales (Biological Analogy)
+
+Hebbi implements three biologically-inspired memory systems:
+
+| Timescale | Mechanism | Biological Analogue | Speed | Persistence |
+|-----------|-----------|-------------------|-------|-------------|
+| **Fast** | Hopfield Memory Bank (Hebbian writes) | Hippocampus (episodic) | ~0ms, no gradients | Session (cleared on /sleep) |
+| **Medium** | GradMem prefix tokens | Working memory | ~50ms, gradient descent | Per-turn adaptation |
+| **Slow** | FF weight updates (/sleep consolidation) | Neocortical consolidation (sleep) | ~seconds, full FF training | Permanent (saved to weights) |
+
+### Two-Speed Learning
+
+**Fast path (every conversation turn):**
+After each user interaction, the model performs a reward-modulated Hebbian write to
+all blocks' memory banks. This is instant (no gradients, no backward pass) — just one
+outer product per block. The user's feedback (good/bad/neutral) acts as a dopamine-like
+neuromodulatory signal.
+
+**Slow path (`/sleep` command):**
+Replays logged episodes through full Forward-Forward training, baking episodic (Hebbian)
+memories into permanent (weight) memories. Like hippocampal replay during biological sleep:
+
+1. Each logged episode is first written to memory banks (restoring Hebbian context)
+2. Then used for FF weight updates with the original reward signal
+3. Recent episodes are replayed more often (recency-weighted sampling)
+4. Banks are cleared after sleep (fresh start for new conversations)
+
+Episodes persist across sessions in `.episodes.jsonl` files, so `/sleep` can consolidate
+memories from multiple conversations.
 
 ### Recurrent Energy Dynamics (energy_steps > 1)
 
@@ -87,20 +140,31 @@ More iterations at inference = better predictions at the cost of latency.
 
 ### GradMem (Test-Time Memory Adaptation)
 
-Learnable prefix memory tokens `M in R^{n_mem x d}` prepended to input.
+Learnable prefix memory tokens `M ∈ R^{n_mem × d}` prepended to input.
 At test time, freeze model weights, gradient-descend on M to minimize reconstruction
 loss on the current context. This enables:
 - Adapting to new users/topics without catastrophic forgetting
 - Compressing long contexts into fixed-size memory
 - Continuous learning from every interaction
 
-### Continual Learning Pipeline
+### FF Normalization (Training Stability)
 
-For the chatbot use case:
-- Base model trained on text corpus with Forward-Forward
-- At inference, GradMem adapts to conversation context
-- Periodic consolidation: successful memory states reinforce base weights
-- No retraining from scratch — the model evolves continuously
+Hinton's original FF paper normalizes block outputs between layers. Without this,
+goodness `x.square().mean()` is unbounded and optimizers can inflate activations,
+causing divergence (observed as goodness explosion at steps 100-180).
+
+Fix applied in `LocalBlock.forward`:
+```python
+x = x + self.attn(norm(x), cos_sin)
+x = x + self.memory_bank.read(x)
+x = x + self.mlp(norm(x))
+goodness = x.square().mean(dim=-1)
+x_out = norm(x)  # ← normalize output for next block
+return x_out, goodness
+```
+
+Combined with per-block gradient clipping (`max_norm=1.0`) and conservative learning
+rates (`block-lr=3e-4`), this eliminates FF divergence.
 
 ---
 
@@ -168,16 +232,21 @@ This eliminates `.backward()` entirely — not just between blocks, but within t
 ## File Structure
 
 ```
-det/
-├── det/
+hebbi/
+├── hebbi/
 │   ├── __init__.py
-│   ├── common.py           # Device detection, COMPUTE_DTYPE, utilities
-│   ├── data.py             # Shakespeare download, CharDataset, data loader
-│   ├── model.py            # DETConfig, EnergyAttention, AttentionResidual, LocalBlock, DET
-│   └── local_learning.py   # FF loss, negative gen, LayerOptimizers, train step
+│   ├── common.py           # Device detection, COMPUTE_DTYPE, DDP utilities
+│   ├── data.py             # BPE tokenizer, HF dataset streaming, SFT data loading
+│   ├── model.py            # DETConfig, EnergyAttention, HopfieldMemoryBank, LocalBlock, DET
+│   └── local_learning.py   # FF loss, negative gen, LayerOptimizers, online learning
 ├── scripts/
-│   ├── train.py            # Training loop with per-layer updates
-│   └── generate.py         # Inference / text generation
+│   ├── train.py            # Pretrain (TinyStories / ClimbMix) with resume
+│   ├── train_sft.py        # SFT on conversation data (SmolTalk)
+│   ├── train_memory.py     # Memory gate training (stage 4)
+│   ├── run_pipeline.py     # Resumable 4-stage training pipeline
+│   ├── generate.py         # Text generation from checkpoint
+│   └── chat.py             # Interactive chat with two-speed online learning
 ├── ARCHITECTURE.md         # This document
+├── TRAINING.md             # Training guide and pipeline docs
 └── pyproject.toml
 ```

@@ -118,7 +118,7 @@ if args.resume:
     checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
     config = DETConfig(**checkpoint["config"])
     model = DET(config).to(device)
-    model.load_state_dict(checkpoint["model"])
+    model.load_state_dict(checkpoint["model"], strict=False)
     start_step = checkpoint.get("step", 0)
     print0(f"Resumed at step {start_step}")
 else:
