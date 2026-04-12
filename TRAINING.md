@@ -36,6 +36,68 @@ python -m scripts.train \
     --batch-size=4 --num-iterations=100
 ```
 
+## One-Command Pipeline (Resumable)
+
+For the full TinyStories → ClimbMix → SmolTalk SFT run, use
+[scripts/run_pipeline.py](scripts/run_pipeline.py). It runs all three stages in
+sequence, each in its own directory under `/workspace/runs/`, and is fully
+resumable — if the pod restarts or you Ctrl+C, just re-run the same command.
+
+It will:
+1. Skip stages already marked complete in `pipeline_state.json`
+2. For an in-progress stage, resume from the latest intermediate checkpoint
+3. For a fresh stage, auto-bootstrap weights from the previous stage's
+   `hebbi_final.pt` (with the step counter reset to 0 so the LR schedule
+   starts clean)
+
+### Bootstrap on RunPod (one time)
+
+```bash
+cd /workspace
+git clone https://github.com/Findeton/hebbi.git
+cd hebbi
+pip install -e .
+```
+
+### Start the pipeline
+
+Run it in `tmux` so it survives SSH drops:
+
+```bash
+tmux new -s train
+cd /workspace/hebbi
+export HF_HOME=/workspace/hf_cache   # persist HF cache on the volume
+python scripts/run_pipeline.py
+# Ctrl+B then D to detach; reattach with: tmux attach -t train
+```
+
+### Resume after interruption
+
+Just re-run the same command — no flags needed:
+
+```bash
+cd /workspace/hebbi
+export HF_HOME=/workspace/hf_cache
+python scripts/run_pipeline.py
+```
+
+### Final outputs
+
+- `/workspace/runs/stage_tinystories/checkpoints/hebbi_final.pt`
+- `/workspace/runs/stage_climbmix/checkpoints/hebbi_final.pt`
+- `/workspace/runs/stage_sft/checkpoints/hebbi_sft_final.pt` ← the chatbot
+
+### GPU memory tuning
+
+Defaults target a 24GB card (RTX A5000 / 3090 / 4090):
+`--batch-size=8 --grad-accum=6` for TinyStories, `--grad-accum=12` for ClimbMix.
+Forward-Forward keeps per-block activations for local learning, so memory
+scales faster than standard backprop training — if you OOM, halve
+`batch-size` and double `grad-accum` (effective batch stays the same). On an
+H100/A100 (80GB) you can push `batch-size=24` for faster throughput.
+
+---
+
 ## Training Pipeline
 
 ### Stage 1: Pretrain on TinyStories
