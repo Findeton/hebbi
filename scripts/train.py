@@ -214,7 +214,10 @@ neg_rng.manual_seed(1337)
 # Training loop
 # ---------------------------------------------------------------------------
 print0(f"\nTraining for {args.num_iterations} steps (grad_accum={args.grad_accum}, effective_batch={args.batch_size * args.grad_accum})...")
-print0(f"Forward-Forward threshold: {config.ff_threshold}")
+if args.backprop:
+    print0("Mode: BACKPROP (baseline)")
+else:
+    print0(f"Mode: Forward-Forward | threshold: {config.ff_threshold}")
 print0(f"Hopfield steps: {config.hopfield_steps} | Energy steps: {config.energy_steps}")
 print0()
 
@@ -296,7 +299,7 @@ for step in range(start_step, args.num_iterations + 1):
     # Smoothed losses
     ema = 0.95
     lm_loss = accum_losses["lm_loss"]
-    ff_avg = sum(v for k, v in accum_losses.items() if k.startswith("ff_")) / config.n_layer
+    ff_avg = sum(v for k, v in accum_losses.items() if k.startswith("ff_")) / max(config.n_layer, 1)
     smooth_lm = ema * smooth_lm + (1 - ema) * lm_loss
     smooth_ff = ema * smooth_ff + (1 - ema) * ff_avg
     age = step - start_step + 1
@@ -305,21 +308,32 @@ for step in range(start_step, args.num_iterations + 1):
 
     # Log
     if step % 10 == 0:
-        g_pos_avg = sum(v for k, v in accum_losses.items() if k.startswith("goodness_pos")) / config.n_layer
-        g_neg_avg = sum(v for k, v in accum_losses.items() if k.startswith("goodness_neg")) / config.n_layer
         elapsed = time.time() - t_start
         toks_per_sec = tokens_processed / elapsed if elapsed > 0 else 0
-        thresh_str = ""
-        if adapt_thresh is not None:
-            thresh_str = f" | th: {adapt_thresh.threshold:.2f}"
-        print0(
-            f"step {step:05d}/{args.num_iterations} | "
-            f"lm: {debiased_lm:.3f} | ff: {debiased_ff:.3f} | "
-            f"g+: {g_pos_avg:.2f} g-: {g_neg_avg:.2f}{thresh_str} | "
-            f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | "
-            f"tok/s: {toks_per_sec:.0f} | "
-            f"elapsed: {elapsed:.0f}s"
-        )
+        # Get actual LR from first block optimizer
+        actual_lr = layer_opts.block_optimizers[0].param_groups[0]["lr"]
+        if args.backprop:
+            print0(
+                f"step {step:05d}/{args.num_iterations} | "
+                f"lm: {debiased_lm:.3f} | "
+                f"lr: {actual_lr:.2e} | dt: {dt*1000:.0f}ms | "
+                f"tok/s: {toks_per_sec:.0f} | "
+                f"elapsed: {elapsed:.0f}s"
+            )
+        else:
+            g_pos_avg = sum(v for k, v in accum_losses.items() if k.startswith("goodness_pos")) / config.n_layer
+            g_neg_avg = sum(v for k, v in accum_losses.items() if k.startswith("goodness_neg")) / config.n_layer
+            thresh_str = ""
+            if adapt_thresh is not None:
+                thresh_str = f" | th: {adapt_thresh.threshold:.2f}"
+            print0(
+                f"step {step:05d}/{args.num_iterations} | "
+                f"lm: {debiased_lm:.3f} | ff: {debiased_ff:.3f} | "
+                f"g+: {g_pos_avg:.2f} g-: {g_neg_avg:.2f}{thresh_str} | "
+                f"lr: {actual_lr:.2e} | dt: {dt*1000:.0f}ms | "
+                f"tok/s: {toks_per_sec:.0f} | "
+                f"elapsed: {elapsed:.0f}s"
+            )
 
     if step % 50 == 0:
         log_dict = {"step": step, "train/lm_loss": debiased_lm, "train/ff_avg": debiased_ff, "train/lrm": lrm}
