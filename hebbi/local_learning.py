@@ -407,9 +407,6 @@ def backprop_step_optimizers(model, layer_opts):
         layer_opts.step_block(i)
     layer_opts.step_head()
 
-    losses["lm_loss"] = lm_loss.item()
-    return losses
-
 
 # ---------------------------------------------------------------------------
 # Energy-consolidated training step
