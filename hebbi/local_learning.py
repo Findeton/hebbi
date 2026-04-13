@@ -118,10 +118,12 @@ class AdaptiveThreshold:
     Checkpoint-safe: state_dict() / load_state_dict() for save/resume.
     """
 
-    def __init__(self, base_threshold=2.0, margin_ratio=0.8, ema_decay=0.99):
+    def __init__(self, base_threshold=2.0, margin_ratio=0.8, ema_decay=0.99,
+                 warmup_steps=500):
         self.base_threshold = base_threshold
         self.margin_ratio = margin_ratio
         self.ema_decay = ema_decay
+        self.warmup_steps = warmup_steps
         self.goodness_ema = 0.0
         self.n_updates = 0
 
@@ -136,19 +138,24 @@ class AdaptiveThreshold:
 
     @property
     def threshold(self):
-        """Current adaptive threshold."""
+        """Current adaptive threshold with linear warmup from base."""
         if self.n_updates == 0:
             return self.base_threshold
-        # No debiasing needed: EMA is initialized from the first observation
-        # (not from zero), so it's already a fair estimate from step 1.
         adaptive = self.margin_ratio * self.goodness_ema
-        return max(self.base_threshold, adaptive)
+        target = max(self.base_threshold, adaptive)
+        # Linear warmup: ramp from base_threshold to target over warmup_steps
+        # This prevents a sudden threshold jump when enabling mid-training
+        if self.n_updates < self.warmup_steps:
+            alpha = self.n_updates / self.warmup_steps
+            return self.base_threshold + alpha * (target - self.base_threshold)
+        return target
 
     def state_dict(self):
         return {
             "base_threshold": self.base_threshold,
             "margin_ratio": self.margin_ratio,
             "ema_decay": self.ema_decay,
+            "warmup_steps": self.warmup_steps,
             "goodness_ema": self.goodness_ema,
             "n_updates": self.n_updates,
         }
@@ -157,6 +164,7 @@ class AdaptiveThreshold:
         self.base_threshold = state["base_threshold"]
         self.margin_ratio = state["margin_ratio"]
         self.ema_decay = state["ema_decay"]
+        self.warmup_steps = state.get("warmup_steps", 500)
         self.goodness_ema = state["goodness_ema"]
         self.n_updates = state["n_updates"]
 

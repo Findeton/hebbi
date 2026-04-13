@@ -302,7 +302,7 @@ for step in range(start_step, args.num_iterations + 1):
         toks_per_sec = tokens_processed / elapsed if elapsed > 0 else 0
         thresh_str = ""
         if adapt_thresh is not None:
-            thresh_str = f" | θ: {adapt_thresh.threshold:.2f}"
+            thresh_str = f" | th: {adapt_thresh.threshold:.2f}"
         print0(
             f"step {step:05d}/{args.num_iterations} | "
             f"lm: {debiased_lm:.3f} | ff: {debiased_ff:.3f} | "
@@ -319,7 +319,7 @@ for step in range(start_step, args.num_iterations + 1):
         wandb_run.log(log_dict)
 
     # --- Checkpoint ---
-    if args.save_every > 0 and step > 0 and step % args.save_every == 0:
+    if args.save_every > 0 and step > start_step and step % args.save_every == 0:
         os.makedirs("checkpoints", exist_ok=True)
         path = f"checkpoints/hebbi_{step:06d}.pt"
         ckpt_data = {
