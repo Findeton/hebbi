@@ -27,6 +27,7 @@ from hebbi.local_learning import (
     generate_negatives,
     generate_negatives_predictive,
     det_train_step,
+    backprop_train_step,
     LayerOptimizers,
     AdaptiveThreshold,
 )
@@ -80,6 +81,9 @@ parser.add_argument("--save-every", type=int, default=1000, help="checkpoint fre
 parser.add_argument("--resume", type=str, default="", help="path to checkpoint to resume from")
 # Compile
 parser.add_argument("--compile", action="store_true", help="use torch.compile (requires PyTorch 2.0+)")
+# Baseline
+parser.add_argument("--backprop", action="store_true",
+                    help="use standard backprop instead of FF (baseline comparison)")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -271,12 +275,15 @@ for step in range(start_step, args.num_iterations + 1):
         batch = next(train_loader)
         x = batch[0]  # works for both (x, y) and (x, y, mask) tuples
 
-        if args.predictive_negatives and not is_char:
-            neg_ids = generate_negatives_predictive(model, x, config.corruption_rate, neg_rng)
+        if args.backprop:
+            losses = backprop_train_step(model, x, layer_opts, config)
         else:
-            neg_ids = generate_negatives(x, config.vocab_size, config.corruption_rate, neg_rng)
-        losses = det_train_step(model, x, neg_ids, layer_opts, config,
-                                adaptive_threshold=adapt_thresh)
+            if args.predictive_negatives and not is_char:
+                neg_ids = generate_negatives_predictive(model, x, config.corruption_rate, neg_rng)
+            else:
+                neg_ids = generate_negatives(x, config.vocab_size, config.corruption_rate, neg_rng)
+            losses = det_train_step(model, x, neg_ids, layer_opts, config,
+                                    adaptive_threshold=adapt_thresh)
 
         tokens_processed += x.numel()
 

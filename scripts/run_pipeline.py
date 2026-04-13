@@ -32,17 +32,27 @@ On resume (just re-run the same command):
     python scripts/run_pipeline.py
 """
 
+import argparse
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+pipeline_parser = argparse.ArgumentParser(description="Hebbi training pipeline")
+pipeline_parser.add_argument("--backprop", action="store_true",
+                             help="use standard backprop instead of FF (baseline)")
+pipeline_args = pipeline_parser.parse_args()
+
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths — backprop runs get their own directory to avoid colliding with FF
 # ---------------------------------------------------------------------------
-RUNS_DIR = Path(os.environ.get("HEBBI_RUNS_DIR", "/workspace/runs"))
+_default_runs = "/workspace/runs_backprop" if pipeline_args.backprop else "/workspace/runs"
+RUNS_DIR = Path(os.environ.get("HEBBI_RUNS_DIR", _default_runs))
 STATE_FILE = RUNS_DIR / "pipeline_state.json"
 
 
@@ -288,7 +298,15 @@ def build_stage_command(stage):
     else:
         log(f"{name}: starting from scratch")
 
-    cmd = [sys.executable, "-m", stage["script"]] + list(stage["args"])
+    stage_args = list(stage["args"])
+
+    # Backprop mode: add --backprop flag and strip FF-only flags
+    if pipeline_args.backprop and stage["script"] == "scripts.train":
+        stage_args = [a for a in stage_args
+                      if a not in ("--adaptive-threshold", "--predictive-negatives")]
+        stage_args.append("--backprop")
+
+    cmd = [sys.executable, "-m", stage["script"]] + stage_args
     if ckpt_path is not None:
         cmd.append(f"{stage['checkpoint_flag']}={ckpt_path}")
 

@@ -362,6 +362,51 @@ def det_train_step(model, pos_ids, neg_ids, layer_opts, config,
 
 
 # ---------------------------------------------------------------------------
+# Backprop baseline training step (for comparison)
+# ---------------------------------------------------------------------------
+
+def backprop_train_step(model, pos_ids, layer_opts, config):
+    """
+    Standard backprop training step — gradients flow through all blocks.
+
+    Uses a single optimizer over all parameters. This exists purely as a
+    baseline to measure whether the DET architecture itself can learn,
+    independently of whether FF local learning is effective.
+
+    Uses the same LayerOptimizers for convenience but steps all at once.
+    """
+    layer_opts.zero_all()
+    losses = {}
+
+    # Full forward pass WITH gradients through all blocks
+    x = norm(model.wte(pos_ids).to(COMPUTE_DTYPE))
+    cos_sin = model._get_cos_sin(pos_ids.size(1))
+
+    # Forward through blocks without detaching (gradients flow everywhere)
+    x, _ = model.forward_blocks(x, cos_sin, return_goodness=False)
+
+    # LM loss
+    logits = model.lm_head(norm(x)).float()
+    targets = pos_ids[:, 1:]
+    lm_loss = F.cross_entropy(
+        logits[:, :-1].reshape(-1, config.vocab_size),
+        targets.reshape(-1),
+    )
+
+    lm_loss.backward()
+
+    # Clip and step all optimizers (blocks + head)
+    all_params = list(model.parameters())
+    torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+    for i in range(len(model.blocks)):
+        layer_opts.step_block(i)
+    layer_opts.step_head()
+
+    losses["lm_loss"] = lm_loss.item()
+    return losses
+
+
+# ---------------------------------------------------------------------------
 # Energy-consolidated training step
 # ---------------------------------------------------------------------------
 
