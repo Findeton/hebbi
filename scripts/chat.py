@@ -73,6 +73,8 @@ parser.add_argument("--sleep-bank-decay", type=float, default=0.3,
 parser.add_argument("--sleep-distill-weight", type=float, default=0.5,
                     help="weight of distillation loss vs FF loss during /sleep "
                          "(0=pure FF on dreams, higher=stronger bank→weight transfer)")
+parser.add_argument("--backprop", action="store_true",
+                    help="use backprop for /sleep consolidation instead of FF")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -264,10 +266,57 @@ def dream_train_step(model, dream_ids, neg_ids, layer_opts, config,
     return losses
 
 
+def dream_backprop_step(model, dream_ids, layer_opts, config, lr_scale=0.5):
+    """
+    Backprop /sleep step: full forward on dream, backprop LM loss through all blocks.
+    """
+    layer_opts.zero_all()
+    losses = {}
+
+    # Temporarily scale learning rates
+    all_opts = layer_opts.block_optimizers + [layer_opts.head_optimizer]
+    saved_lrs = []
+    for opt in all_opts:
+        group_lrs = []
+        for g in opt.param_groups:
+            group_lrs.append(g["lr"])
+            g["lr"] = g["lr"] * lr_scale
+        saved_lrs.append(group_lrs)
+
+    try:
+        x = norm(model.wte(dream_ids).to(COMPUTE_DTYPE))
+        cos_sin = model._get_cos_sin(dream_ids.size(1))
+        x, _ = model.forward_blocks(x, cos_sin, return_goodness=False)
+
+        logits = model.lm_head(norm(x)).float()
+        targets = dream_ids[:, 1:]
+        lm_loss = F.cross_entropy(
+            logits[:, :-1].reshape(-1, config.vocab_size),
+            targets.reshape(-1),
+        )
+        lm_loss.backward()
+        all_params = list(model.parameters())
+        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+        for i in range(len(model.blocks)):
+            layer_opts.step_block(i)
+        layer_opts.step_head()
+
+        losses["lm_loss"] = lm_loss.item()
+        losses["ff_avg"] = 0.0
+        losses["distill_avg"] = 0.0
+    finally:
+        for opt, group_lrs in zip(all_opts, saved_lrs):
+            for g, lr in zip(opt.param_groups, group_lrs):
+                g["lr"] = lr
+
+    return losses
+
+
 def run_sleep_hebbian(model, layer_opts, config, tokenizer, neg_rng,
                      n_dreams=16, n_epochs=2,
                      dream_length=128, dream_temperature=1.0,
-                     distill_weight=0.5, bank_decay_after=0.3):
+                     distill_weight=0.5, bank_decay_after=0.3,
+                     use_backprop=False):
     """
     Memory consolidation via bank-driven dreams (pure Hebbian replay).
 
@@ -371,14 +420,16 @@ def run_sleep_hebbian(model, layer_opts, config, tokenizer, neg_rng,
                 config.corruption_rate, neg_rng,
             )
 
-            # --- 2b. FF + distillation on the dream ---
-            # lr_scale=0.5 because dreams are self-generated and less
-            # trusted than waking data. distill_weight controls how
-            # strongly the bank's contribution gets absorbed into weights.
-            losses = dream_train_step(
-                model, dream_tensor, neg_tensor, layer_opts, config,
-                distill_weight=distill_weight, lr_scale=0.5,
-            )
+            # --- 2b. Train on the dream ---
+            if use_backprop:
+                losses = dream_backprop_step(
+                    model, dream_tensor, layer_opts, config, lr_scale=0.5,
+                )
+            else:
+                losses = dream_train_step(
+                    model, dream_tensor, neg_tensor, layer_opts, config,
+                    distill_weight=distill_weight, lr_scale=0.5,
+                )
             total_lm += losses["lm_loss"]
             total_ff += losses["ff_avg"]
             total_distill += losses["distill_avg"]
@@ -494,6 +545,7 @@ while True:
             dream_temperature=args.dream_temperature,
             distill_weight=args.sleep_distill_weight,
             bank_decay_after=args.sleep_bank_decay,
+            use_backprop=args.backprop,
         )
         if n_steps:
             n_online_updates += n_steps
@@ -572,6 +624,7 @@ while True:
                 dream_temperature=args.dream_temperature,
                 distill_weight=args.sleep_distill_weight,
                 bank_decay_after=args.sleep_bank_decay,
+                use_backprop=args.backprop,
             )
             if n_steps:
                 n_online_updates += n_steps

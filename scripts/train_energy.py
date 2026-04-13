@@ -27,8 +27,9 @@ import argparse
 from dataclasses import asdict
 
 import torch
+import torch.nn.functional as F
 
-from hebbi.model import DET, DETConfig
+from hebbi.model import DET, DETConfig, norm
 from hebbi.local_learning import (
     generate_negatives,
     det_train_step_with_energy,
@@ -73,6 +74,8 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.3)
 parser.add_argument("--save-every", type=int, default=500)
 parser.add_argument("--sample-every", type=int, default=500)
 parser.add_argument("--compile", action="store_true")
+parser.add_argument("--backprop", action="store_true",
+                    help="use standard backprop instead of FF (baseline)")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -149,6 +152,8 @@ neg_rng.manual_seed(1337)
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+if args.backprop:
+    print0("Mode: BACKPROP (baseline)")
 print0(f"\nEnergy consolidation for {args.num_iterations} steps...")
 print0(f"Each step: {args.energy_steps} passes through block stack, "
        f"one optimizer step at the end")
@@ -188,54 +193,83 @@ for step in range(args.num_iterations + 1):
 
     batch = next(train_loader)
     x = batch[0]
-    neg_ids = generate_negatives(x, config.vocab_size, config.corruption_rate, neg_rng)
 
-    losses = det_train_step_with_energy(
-        model, x, neg_ids, layer_opts, config, energy_weights
-    )
+    if args.backprop:
+        # Backprop energy: full forward with multiple energy passes, backprop LM loss
+        layer_opts.zero_all()
+        x_emb = norm(model.wte(x).to(COMPUTE_DTYPE))
+        cos_sin = model._get_cos_sin(x.size(1))
+        h = x_emb
+        for e in range(args.energy_steps):
+            h, _ = model.forward_blocks(h, cos_sin, return_goodness=False)
+        logits = model.lm_head(norm(h)).float()
+        lm_loss = F.cross_entropy(
+            logits[:, :-1].reshape(-1, config.vocab_size),
+            x[:, 1:].reshape(-1),
+        )
+        lm_loss.backward()
+        all_params = list(model.parameters())
+        torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+        for i in range(len(model.blocks)):
+            layer_opts.step_block(i)
+        layer_opts.step_head()
+        losses = {"lm_loss": lm_loss.item()}
+    else:
+        neg_ids = generate_negatives(x, config.vocab_size, config.corruption_rate, neg_rng)
+        losses = det_train_step_with_energy(
+            model, x, neg_ids, layer_opts, config, energy_weights
+        )
 
     tokens_processed += x.numel()
     dt = time.time() - t0
 
     # Smoothed losses
     ema = 0.95
-    lm_loss = losses["lm_loss"]
-    ff_avg = sum(v for k, v in losses.items()
-                 if k.startswith("ff_") and "_e" not in k) / config.n_layer
-    smooth_lm = ema * smooth_lm + (1 - ema) * lm_loss
+    lm_loss_val = losses["lm_loss"]
+    ff_keys = [k for k in losses if k.startswith("ff_") and "_e" not in k]
+    ff_avg = sum(losses[k] for k in ff_keys) / max(len(ff_keys), 1)
+    smooth_lm = ema * smooth_lm + (1 - ema) * lm_loss_val
     smooth_ff = ema * smooth_ff + (1 - ema) * ff_avg
     debiased_lm = smooth_lm / (1 - ema ** (step + 1))
     debiased_ff = smooth_ff / (1 - ema ** (step + 1))
 
     if step % 10 == 0:
-        g_pos_avg = sum(v for k, v in losses.items()
-                        if k.startswith("goodness_pos_") and "_e" not in k
-                        ) / config.n_layer
-        g_neg_avg = sum(v for k, v in losses.items()
-                        if k.startswith("goodness_neg_") and "_e" not in k
-                        ) / config.n_layer
-        # Per-energy-stage diagnostics: FF loss, LM loss, convergence delta
-        per_stage = []
-        E = args.energy_steps
-        for e in range(E):
-            stage_ff = sum(losses[f"ff_{i}_e{e}"] for i in range(config.n_layer)) / config.n_layer
-            parts = [f"e{e}: ff={stage_ff:.3f}"]
-            if f"lm_loss_e{e}" in losses:
-                parts.append(f"lm={losses[f'lm_loss_e{e}']:.3f}")
-            if f"energy_delta_e{e}" in losses:
-                parts.append(f"d={losses[f'energy_delta_e{e}']:.4f}")
-            per_stage.append(" ".join(parts))
-        stage_str = " | ".join(per_stage)
-
         elapsed = time.time() - t_start
         toks_per_sec = tokens_processed / elapsed if elapsed > 0 else 0
-        print0(
-            f"step {step:05d}/{args.num_iterations} | "
-            f"lm: {debiased_lm:.3f} | ff: {debiased_ff:.3f} [{stage_str}] | "
-            f"g+: {g_pos_avg:.2f} g-: {g_neg_avg:.2f} | "
-            f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | "
-            f"tok/s: {toks_per_sec:.0f}"
-        )
+        actual_lr = layer_opts.block_optimizers[0].param_groups[0]["lr"]
+
+        if args.backprop:
+            print0(
+                f"step {step:05d}/{args.num_iterations} | "
+                f"lm: {debiased_lm:.3f} | "
+                f"lr: {actual_lr:.2e} | dt: {dt*1000:.0f}ms | "
+                f"tok/s: {toks_per_sec:.0f}"
+            )
+        else:
+            g_pos_avg = sum(v for k, v in losses.items()
+                            if k.startswith("goodness_pos_") and "_e" not in k
+                            ) / config.n_layer
+            g_neg_avg = sum(v for k, v in losses.items()
+                            if k.startswith("goodness_neg_") and "_e" not in k
+                            ) / config.n_layer
+            per_stage = []
+            E = args.energy_steps
+            for e in range(E):
+                stage_ff = sum(losses[f"ff_{i}_e{e}"] for i in range(config.n_layer)) / config.n_layer
+                parts = [f"e{e}: ff={stage_ff:.3f}"]
+                if f"lm_loss_e{e}" in losses:
+                    parts.append(f"lm={losses[f'lm_loss_e{e}']:.3f}")
+                if f"energy_delta_e{e}" in losses:
+                    parts.append(f"d={losses[f'energy_delta_e{e}']:.4f}")
+                per_stage.append(" ".join(parts))
+            stage_str = " | ".join(per_stage)
+            print0(
+                f"step {step:05d}/{args.num_iterations} | "
+                f"lm: {debiased_lm:.3f} | ff: {debiased_ff:.3f} [{stage_str}] | "
+                f"g+: {g_pos_avg:.2f} g-: {g_neg_avg:.2f} | "
+                f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | "
+                f"tok/s: {toks_per_sec:.0f}"
+            )
 
     if step % 50 == 0:
         log_dict = {

@@ -339,7 +339,7 @@ def build_stage_command(stage):
     stage_args = list(stage["args"])
 
     # Backprop mode: add --backprop flag and strip FF-only flags
-    if pipeline_args.backprop and stage["script"] == "scripts.train":
+    if pipeline_args.backprop:
         stage_args = [a for a in stage_args
                       if a not in ("--adaptive-threshold", "--predictive-negatives")]
         stage_args.append("--backprop")

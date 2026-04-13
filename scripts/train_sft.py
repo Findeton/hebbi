@@ -52,6 +52,8 @@ parser.add_argument("--save-every", type=int, default=500)
 parser.add_argument("--eval-every", type=int, default=100)
 parser.add_argument("--sample-every", type=int, default=500)
 parser.add_argument("--compile", action="store_true")
+parser.add_argument("--backprop", action="store_true",
+                    help="use standard backprop instead of FF (baseline)")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -171,6 +173,43 @@ def sft_train_step(model, pos_ids, loss_mask, neg_ids, layer_opts, config):
     losses["mask_ratio"] = mask_flat.mean().item()
     return losses
 
+
+def sft_backprop_step(model, pos_ids, loss_mask, layer_opts, config):
+    """
+    Backprop SFT: full forward pass, masked cross-entropy, backprop through all blocks.
+    """
+    layer_opts.zero_all()
+    losses = {}
+
+    x = norm(model.wte(pos_ids).to(COMPUTE_DTYPE))
+    cos_sin = model._get_cos_sin(pos_ids.size(1))
+    x, _ = model.forward_blocks(x, cos_sin, return_goodness=False)
+
+    logits = model.lm_head(norm(x)).float()
+    targets = pos_ids[:, 1:]
+    target_mask = loss_mask[:, 1:]
+
+    logits_flat = logits[:, :-1].reshape(-1, config.vocab_size)
+    targets_flat = targets.reshape(-1)
+    mask_flat = target_mask.reshape(-1).float()
+
+    per_token_loss = F.cross_entropy(logits_flat, targets_flat, reduction="none")
+    if mask_flat.sum() > 0:
+        lm_loss = (per_token_loss * mask_flat).sum() / mask_flat.sum()
+    else:
+        lm_loss = per_token_loss.mean()
+
+    lm_loss.backward()
+    all_params = list(model.parameters())
+    torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+    for i in range(len(model.blocks)):
+        layer_opts.step_block(i)
+    layer_opts.step_head()
+
+    losses["lm_loss"] = lm_loss.item()
+    losses["mask_ratio"] = mask_flat.mean().item()
+    return losses
+
 # ---------------------------------------------------------------------------
 # Optimizers
 # ---------------------------------------------------------------------------
@@ -182,6 +221,8 @@ neg_rng.manual_seed(1337)
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+if args.backprop:
+    print0("Mode: BACKPROP (baseline)")
 print0(f"\nSFT training for {args.num_iterations} steps...")
 print0()
 
@@ -217,9 +258,12 @@ for step in range(args.num_iterations + 1):
     lrm = layer_opts.update_lr(step, args.num_iterations, args.warmup_steps, args.warmdown_ratio)
 
     x, y, loss_mask = next(train_loader)
-    neg_ids = generate_negatives(x, config.vocab_size, config.corruption_rate, neg_rng)
 
-    losses = sft_train_step(model, x, loss_mask, neg_ids, layer_opts, config)
+    if args.backprop:
+        losses = sft_backprop_step(model, x, loss_mask, layer_opts, config)
+    else:
+        neg_ids = generate_negatives(x, config.vocab_size, config.corruption_rate, neg_rng)
+        losses = sft_train_step(model, x, loss_mask, neg_ids, layer_opts, config)
     dt = time.time() - t0
 
     # Smoothed loss

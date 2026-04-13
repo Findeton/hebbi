@@ -62,6 +62,8 @@ parser.add_argument("--warmdown-ratio", type=float, default=0.3)
 parser.add_argument("--save-every", type=int, default=500)
 parser.add_argument("--sample-every", type=int, default=500)
 parser.add_argument("--compile", action="store_true")
+parser.add_argument("--backprop", action="store_true",
+                    help="use standard backprop instead of FF (baseline)")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -206,6 +208,51 @@ def memory_train_step(model, context_ids, target_pos, target_neg,
     return losses
 
 
+def memory_backprop_step(model, context_ids, target_pos, layer_opts, config):
+    """
+    Backprop memory training:
+      1. Populate banks from context (same Hebbian write, no gradients)
+      2. Full backprop forward on target with banks populated
+      3. Clear banks
+    """
+    # --- Phase 1: Populate memory banks from context ---
+    model.eval()
+    with torch.no_grad():
+        block_ios = model.forward_and_collect(context_ids)
+        model.write_to_banks(block_ios)
+    model.train()
+
+    # --- Phase 2: Backprop on target with banks populated ---
+    layer_opts.zero_all()
+    losses = {}
+
+    x = norm(model.wte(target_pos).to(COMPUTE_DTYPE))
+    cos_sin = model._get_cos_sin(target_pos.size(1))
+    x, _ = model.forward_blocks(x, cos_sin, return_goodness=False)
+
+    logits = model.lm_head(norm(x)).float()
+    targets = target_pos[:, 1:]
+    lm_loss = F.cross_entropy(
+        logits[:, :-1].reshape(-1, config.vocab_size),
+        targets.reshape(-1),
+    )
+    lm_loss.backward()
+    all_params = list(model.parameters())
+    torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+    for i in range(len(model.blocks)):
+        layer_opts.step_block(i)
+    layer_opts.step_head()
+
+    losses["lm_loss"] = lm_loss.item()
+    for i, block in enumerate(model.blocks):
+        losses[f"gate_{i}"] = torch.sigmoid(block.memory_bank.gate).item()
+
+    # --- Phase 3: Clear banks ---
+    model.clear_banks()
+
+    return losses
+
+
 # ---------------------------------------------------------------------------
 # Optimizers
 # ---------------------------------------------------------------------------
@@ -217,8 +264,10 @@ neg_rng.manual_seed(1337)
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+if args.backprop:
+    print0("Mode: BACKPROP (baseline)")
 print0(f"\nMemory training for {args.num_iterations} steps...")
-print0(f"Each step: context batch → Hebbian write → target batch → FF+LM loss")
+print0(f"Each step: context batch → Hebbian write → target batch → {'backprop' if args.backprop else 'FF+LM'} loss")
 print0()
 
 smooth_lm = 0.0
@@ -266,11 +315,13 @@ for step in range(args.num_iterations + 1):
     tgt_batch = next(target_loader)
     tgt_ids = tgt_batch[0]  # (B, T)
 
-    neg_ids = generate_negatives(tgt_ids, config.vocab_size,
-                                 config.corruption_rate, neg_rng)
-
-    losses = memory_train_step(model, ctx_ids, tgt_ids, neg_ids,
-                               layer_opts, config)
+    if args.backprop:
+        losses = memory_backprop_step(model, ctx_ids, tgt_ids, layer_opts, config)
+    else:
+        neg_ids = generate_negatives(tgt_ids, config.vocab_size,
+                                     config.corruption_rate, neg_rng)
+        losses = memory_train_step(model, ctx_ids, tgt_ids, neg_ids,
+                                   layer_opts, config)
     dt = time.time() - t0
 
     # Smoothed losses
@@ -283,21 +334,30 @@ for step in range(args.num_iterations + 1):
     debiased_ff = smooth_ff / (1 - ema ** (step + 1))
 
     if step % 10 == 0:
-        g_pos_avg = sum(v for k, v in losses.items()
-                        if k.startswith("goodness_pos")) / config.n_layer
-        g_neg_avg = sum(v for k, v in losses.items()
-                        if k.startswith("goodness_neg")) / config.n_layer
         gate_avg = sum(v for k, v in losses.items()
                        if k.startswith("gate_")) / config.n_layer
         elapsed = time.time() - t_start
-        print0(
-            f"step {step:05d}/{args.num_iterations} | "
-            f"lm: {debiased_lm:.3f} | ff: {debiased_ff:.3f} | "
-            f"g+: {g_pos_avg:.2f} g-: {g_neg_avg:.2f} | "
-            f"gate: {gate_avg:.3f} | "
-            f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | "
-            f"elapsed: {elapsed:.0f}s"
-        )
+        if args.backprop:
+            print0(
+                f"step {step:05d}/{args.num_iterations} | "
+                f"lm: {debiased_lm:.3f} | "
+                f"gate: {gate_avg:.3f} | "
+                f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | "
+                f"elapsed: {elapsed:.0f}s"
+            )
+        else:
+            g_pos_avg = sum(v for k, v in losses.items()
+                            if k.startswith("goodness_pos")) / config.n_layer
+            g_neg_avg = sum(v for k, v in losses.items()
+                            if k.startswith("goodness_neg")) / config.n_layer
+            print0(
+                f"step {step:05d}/{args.num_iterations} | "
+                f"lm: {debiased_lm:.3f} | ff: {debiased_ff:.3f} | "
+                f"g+: {g_pos_avg:.2f} g-: {g_neg_avg:.2f} | "
+                f"gate: {gate_avg:.3f} | "
+                f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | "
+                f"elapsed: {elapsed:.0f}s"
+            )
 
     if step % 50 == 0:
         log_dict = {
