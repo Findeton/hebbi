@@ -118,7 +118,7 @@ class AdaptiveThreshold:
     Checkpoint-safe: state_dict() / load_state_dict() for save/resume.
     """
 
-    def __init__(self, base_threshold=2.0, margin_ratio=0.8, ema_decay=0.99,
+    def __init__(self, base_threshold=2.0, margin_ratio=0.5, ema_decay=0.999,
                  warmup_steps=500):
         self.base_threshold = base_threshold
         self.margin_ratio = margin_ratio

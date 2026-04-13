@@ -66,7 +66,7 @@ parser.add_argument("--embed-lr", type=float, default=1e-2, help="learning rate 
 parser.add_argument("--corruption-rate", type=float, default=0.15, help="token corruption rate")
 parser.add_argument("--adaptive-threshold", action="store_true",
                     help="enable adaptive FF threshold that tracks goodness")
-parser.add_argument("--threshold-margin", type=float, default=0.8,
+parser.add_argument("--threshold-margin", type=float, default=0.5,
                     help="adaptive threshold = margin * EMA(goodness_pos)")
 parser.add_argument("--predictive-negatives", action="store_true",
                     help="use model predictions as negatives (predictive coding)")
@@ -193,6 +193,8 @@ if args.adaptive_threshold:
     # Restore state from checkpoint if available
     if args.resume and "adaptive_threshold" in checkpoint:
         adapt_thresh.load_state_dict(checkpoint["adaptive_threshold"])
+        # CLI flags override saved hyperparameters (so you can tune mid-training)
+        adapt_thresh.margin_ratio = args.threshold_margin
         print0(f"Restored adaptive threshold: {adapt_thresh.threshold:.2f} "
                f"(EMA={adapt_thresh.goodness_ema:.2f}, n={adapt_thresh.n_updates})")
     print0(f"Adaptive threshold enabled: base={config.ff_threshold}, margin={args.threshold_margin}")
