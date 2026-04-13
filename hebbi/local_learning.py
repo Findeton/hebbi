@@ -39,6 +39,50 @@ def generate_negatives(input_ids, vocab_size, corruption_rate=0.15, rng=None):
     return neg_ids
 
 
+def generate_negatives_predictive(model, input_ids, corruption_rate=0.15, rng=None):
+    """
+    Predictive coding negatives: replace tokens with the model's own predictions.
+
+    Instead of random token replacement, we use what the model thinks should be
+    there. This is much harder to detect — the blocks must learn deep language
+    structure, not just spot statistical outliers.
+
+    Biologically: this is predictive coding. The negative is "what I predicted,"
+    the positive is "what actually happened." The blocks learn to compute
+    prediction errors — exactly what cortical columns are thought to do.
+
+    As the model improves, its predictions become more plausible, so negatives
+    get harder automatically. Natural curriculum with no scheduling needed.
+    """
+    B, T = input_ids.shape
+    device = input_ids.device
+
+    # Get model predictions (no gradients, inference only)
+    with torch.no_grad():
+        logits = model(input_ids)  # (B, T, V)
+
+    # Sample from predictions (shifted right: logits[:, t] predicts token t+1)
+    # For position t, we use logits[:, t-1] (what the model predicted for position t)
+    # For position 0, we fall back to random (no prediction available)
+    probs = F.softmax(logits[:, :-1, :], dim=-1)  # (B, T-1, V)
+    predicted = torch.multinomial(
+        probs.reshape(-1, probs.size(-1)), num_samples=1
+    ).reshape(B, T - 1)  # (B, T-1)
+
+    # Pad position 0 with a random token (no prediction for the first token)
+    rng_device = rng.device if rng is not None else device
+    first_token = torch.randint(
+        0, logits.size(-1), (B, 1), device=rng_device, generator=rng
+    ).to(device)
+    predicted = torch.cat([first_token, predicted.to(device)], dim=1)  # (B, T)
+
+    # Apply corruption mask (same rate as random negatives)
+    mask = torch.rand(B, T, device=rng_device, generator=rng) < corruption_rate
+    mask = mask.to(device)
+    neg_ids = torch.where(mask, predicted, input_ids)
+    return neg_ids
+
+
 # ---------------------------------------------------------------------------
 # Forward-Forward loss
 # ---------------------------------------------------------------------------
@@ -55,6 +99,66 @@ def forward_forward_loss(goodness_pos, goodness_neg, threshold):
     loss_pos = F.softplus(-(goodness_pos - threshold)).mean()
     loss_neg = F.softplus(-(threshold - goodness_neg)).mean()
     return loss_pos + loss_neg
+
+
+class AdaptiveThreshold:
+    """
+    Adaptive FF threshold that tracks goodness and stays challenging.
+
+    Fixed threshold saturates: once goodness >> θ, FF loss → 0 and blocks
+    stop learning. This tracker keeps θ at a fraction of the running average
+    of positive goodness, so the objective stays non-trivial throughout training.
+
+    θ_adaptive = max(θ_base, margin_ratio * EMA(g_pos))
+
+    The base threshold is a floor — the adaptive threshold never drops below it.
+    margin_ratio < 1 means "keep the threshold just below where goodness is,"
+    so blocks always have to push a little harder.
+
+    Checkpoint-safe: state_dict() / load_state_dict() for save/resume.
+    """
+
+    def __init__(self, base_threshold=2.0, margin_ratio=0.8, ema_decay=0.99):
+        self.base_threshold = base_threshold
+        self.margin_ratio = margin_ratio
+        self.ema_decay = ema_decay
+        self.goodness_ema = 0.0
+        self.n_updates = 0
+
+    def update(self, goodness_pos_mean):
+        """Update EMA with the current step's mean positive goodness."""
+        if self.n_updates == 0:
+            self.goodness_ema = goodness_pos_mean
+        else:
+            self.goodness_ema = (self.ema_decay * self.goodness_ema
+                                 + (1 - self.ema_decay) * goodness_pos_mean)
+        self.n_updates += 1
+
+    @property
+    def threshold(self):
+        """Current adaptive threshold."""
+        if self.n_updates == 0:
+            return self.base_threshold
+        # No debiasing needed: EMA is initialized from the first observation
+        # (not from zero), so it's already a fair estimate from step 1.
+        adaptive = self.margin_ratio * self.goodness_ema
+        return max(self.base_threshold, adaptive)
+
+    def state_dict(self):
+        return {
+            "base_threshold": self.base_threshold,
+            "margin_ratio": self.margin_ratio,
+            "ema_decay": self.ema_decay,
+            "goodness_ema": self.goodness_ema,
+            "n_updates": self.n_updates,
+        }
+
+    def load_state_dict(self, state):
+        self.base_threshold = state["base_threshold"]
+        self.margin_ratio = state["margin_ratio"]
+        self.ema_decay = state["ema_decay"]
+        self.goodness_ema = state["goodness_ema"]
+        self.n_updates = state["n_updates"]
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +243,8 @@ class LayerOptimizers:
 # Core training step
 # ---------------------------------------------------------------------------
 
-def det_train_step(model, pos_ids, neg_ids, layer_opts, config):
+def det_train_step(model, pos_ids, neg_ids, layer_opts, config,
+                   adaptive_threshold=None):
     """
     One DET training step with local Forward-Forward + LM head.
 
@@ -160,10 +265,16 @@ def det_train_step(model, pos_ids, neg_ids, layer_opts, config):
       - Step the head optimizer
 
     No gradient ever flows from one block to another.
+
+    Args:
+        adaptive_threshold: optional AdaptiveThreshold instance. If provided,
+            uses its adaptive threshold instead of config.ff_threshold and
+            updates it with this step's mean positive goodness.
     """
     layer_opts.zero_all()
     losses = {}
-    threshold = config.ff_threshold
+    threshold = (adaptive_threshold.threshold if adaptive_threshold is not None
+                 else config.ff_threshold)
 
     # --- Phase 1: Per-block Forward-Forward ---
     # Embed positive and negative (no gradient for embedding in this phase)
@@ -201,6 +312,13 @@ def det_train_step(model, pos_ids, neg_ids, layer_opts, config):
         losses[f"ff_{i}"] = ff_loss.item()
         losses[f"goodness_pos_{i}"] = g_pos.mean().item()
         losses[f"goodness_neg_{i}"] = g_neg.mean().item()
+
+    # Update adaptive threshold with this step's mean positive goodness
+    if adaptive_threshold is not None:
+        g_pos_avg = sum(v for k, v in losses.items()
+                        if k.startswith("goodness_pos_")) / len(model.blocks)
+        adaptive_threshold.update(g_pos_avg)
+        losses["ff_threshold"] = threshold
 
     # --- Phase 2: LM head + embedding loss ---
     # LM head: next-token prediction from final block output (detached from blocks)

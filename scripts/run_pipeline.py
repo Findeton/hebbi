@@ -75,6 +75,8 @@ STAGES = [
             "--sample-every=2000",
             "--eval-every=-1",
             "--device-type=cuda",
+            "--adaptive-threshold",
+            "--predictive-negatives",
         ],
     },
     {
@@ -99,6 +101,8 @@ STAGES = [
             "--embed-lr=3e-3",
             "--save-every=2500",
             "--sample-every=5000",
+            "--adaptive-threshold",
+            "--predictive-negatives",
             "--eval-every=-1",
             "--device-type=cuda",
         ],

@@ -25,8 +25,10 @@ import torch
 from hebbi.model import DET, DETConfig
 from hebbi.local_learning import (
     generate_negatives,
+    generate_negatives_predictive,
     det_train_step,
     LayerOptimizers,
+    AdaptiveThreshold,
 )
 from hebbi.data import (
     get_shakespeare, CharDataset, char_data_loader,
@@ -62,6 +64,12 @@ parser.add_argument("--block-lr", type=float, default=1e-3, help="learning rate 
 parser.add_argument("--head-lr", type=float, default=1e-3, help="learning rate for LM head")
 parser.add_argument("--embed-lr", type=float, default=1e-2, help="learning rate for embedding")
 parser.add_argument("--corruption-rate", type=float, default=0.15, help="token corruption rate")
+parser.add_argument("--adaptive-threshold", action="store_true",
+                    help="enable adaptive FF threshold that tracks goodness")
+parser.add_argument("--threshold-margin", type=float, default=0.8,
+                    help="adaptive threshold = margin * EMA(goodness_pos)")
+parser.add_argument("--predictive-negatives", action="store_true",
+                    help="use model predictions as negatives (predictive coding)")
 parser.add_argument("--warmup-steps", type=int, default=40, help="LR warmup steps")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="LR warmdown ratio")
 # Eval
@@ -120,6 +128,12 @@ if args.resume:
     model = DET(config).to(device)
     model.load_state_dict(checkpoint["model"], strict=False)
     start_step = checkpoint.get("step", 0)
+    # CLI flags override checkpoint state for these features
+    # (so you can enable them mid-training by adding the flag on resume)
+    if args.adaptive_threshold:
+        config.ff_threshold = args.ff_threshold
+    if args.corruption_rate != 0.15:  # explicit override
+        config.corruption_rate = args.corruption_rate
     print0(f"Resumed at step {start_step}")
 else:
     # Build config
@@ -168,6 +182,23 @@ if args.compile and hasattr(torch, "compile"):
 # Optimizers
 # ---------------------------------------------------------------------------
 layer_opts = LayerOptimizers(model, args.block_lr, args.head_lr, args.embed_lr)
+
+# Adaptive threshold (optional)
+adapt_thresh = None
+if args.adaptive_threshold:
+    adapt_thresh = AdaptiveThreshold(
+        base_threshold=config.ff_threshold,
+        margin_ratio=args.threshold_margin,
+    )
+    # Restore state from checkpoint if available
+    if args.resume and "adaptive_threshold" in checkpoint:
+        adapt_thresh.load_state_dict(checkpoint["adaptive_threshold"])
+        print0(f"Restored adaptive threshold: {adapt_thresh.threshold:.2f} "
+               f"(EMA={adapt_thresh.goodness_ema:.2f}, n={adapt_thresh.n_updates})")
+    print0(f"Adaptive threshold enabled: base={config.ff_threshold}, margin={args.threshold_margin}")
+
+if args.predictive_negatives:
+    print0("Predictive coding negatives enabled")
 
 # RNG for negatives (MPS doesn't support torch.Generator, use CPU)
 neg_rng = torch.Generator(device="cpu")
@@ -238,8 +269,12 @@ for step in range(start_step, args.num_iterations + 1):
         batch = next(train_loader)
         x = batch[0]  # works for both (x, y) and (x, y, mask) tuples
 
-        neg_ids = generate_negatives(x, config.vocab_size, config.corruption_rate, neg_rng)
-        losses = det_train_step(model, x, neg_ids, layer_opts, config)
+        if args.predictive_negatives and not is_char:
+            neg_ids = generate_negatives_predictive(model, x, config.corruption_rate, neg_rng)
+        else:
+            neg_ids = generate_negatives(x, config.vocab_size, config.corruption_rate, neg_rng)
+        losses = det_train_step(model, x, neg_ids, layer_opts, config,
+                                adaptive_threshold=adapt_thresh)
 
         tokens_processed += x.numel()
 
@@ -265,10 +300,13 @@ for step in range(start_step, args.num_iterations + 1):
         g_neg_avg = sum(v for k, v in accum_losses.items() if k.startswith("goodness_neg")) / config.n_layer
         elapsed = time.time() - t_start
         toks_per_sec = tokens_processed / elapsed if elapsed > 0 else 0
+        thresh_str = ""
+        if adapt_thresh is not None:
+            thresh_str = f" | θ: {adapt_thresh.threshold:.2f}"
         print0(
             f"step {step:05d}/{args.num_iterations} | "
             f"lm: {debiased_lm:.3f} | ff: {debiased_ff:.3f} | "
-            f"g+: {g_pos_avg:.2f} g-: {g_neg_avg:.2f} | "
+            f"g+: {g_pos_avg:.2f} g-: {g_neg_avg:.2f}{thresh_str} | "
             f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | "
             f"tok/s: {toks_per_sec:.0f} | "
             f"elapsed: {elapsed:.0f}s"
@@ -284,23 +322,29 @@ for step in range(start_step, args.num_iterations + 1):
     if args.save_every > 0 and step > 0 and step % args.save_every == 0:
         os.makedirs("checkpoints", exist_ok=True)
         path = f"checkpoints/hebbi_{step:06d}.pt"
-        torch.save({
+        ckpt_data = {
             "config": asdict(config),
             "model": model.state_dict(),
             "step": step,
             "dataset": args.dataset,
-        }, path)
+        }
+        if adapt_thresh is not None:
+            ckpt_data["adaptive_threshold"] = adapt_thresh.state_dict()
+        torch.save(ckpt_data, path)
         print0(f"Saved checkpoint: {path}")
 
 # Final save
 os.makedirs("checkpoints", exist_ok=True)
 path = "checkpoints/hebbi_final.pt"
-torch.save({
+final_ckpt = {
     "config": asdict(config),
     "model": model.state_dict(),
     "step": args.num_iterations,
     "dataset": args.dataset,
-}, path)
+}
+if adapt_thresh is not None:
+    final_ckpt["adaptive_threshold"] = adapt_thresh.state_dict()
+torch.save(final_ckpt, path)
 elapsed = time.time() - t_start
 print0(f"\nTraining complete in {elapsed:.0f}s. Final checkpoint: {path}")
 print0(f"Total tokens processed: {tokens_processed:,}")
