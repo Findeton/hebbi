@@ -181,6 +181,44 @@ STAGES = [
     },
 ]
 
+
+# ---------------------------------------------------------------------------
+# Backprop overrides: ~5x fewer iterations, checkpoints every 500 steps
+# ---------------------------------------------------------------------------
+if pipeline_args.backprop:
+    _BACKPROP_OVERRIDES = {
+        "tinystories":  {"--num-iterations": "4000",  "--save-every": "500",
+                         "--sample-every": "500",  "--warmup-steps": "200"},
+        "climbmix":     {"--num-iterations": "10000", "--save-every": "500",
+                         "--sample-every": "1000", "--warmup-steps": "300"},
+        "sft":          {"--num-iterations": "600",   "--save-every": "200",
+                         "--sample-every": "200",  "--warmup-steps": "10"},
+        "energy":       {"--num-iterations": "400",   "--save-every": "200",
+                         "--sample-every": "200",  "--warmup-steps": "20"},
+        "memory":       {"--num-iterations": "200",   "--save-every": "100",
+                         "--sample-every": "100",  "--warmup-steps": "10"},
+    }
+    for stage in STAGES:
+        overrides = _BACKPROP_OVERRIDES.get(stage["name"], {})
+        if overrides:
+            # Replace matching args in-place
+            new_args = []
+            for arg in stage["args"]:
+                key = arg.split("=")[0] if "=" in arg else arg
+                if key in overrides:
+                    new_args.append(f"{key}={overrides[key]}")
+                    del overrides[key]
+                else:
+                    new_args.append(arg)
+            # Append any remaining overrides not already present
+            for key, val in overrides.items():
+                new_args.append(f"{key}={val}")
+            stage["args"] = new_args
+            # Update num_iterations metadata too
+            if "--num-iterations" in _BACKPROP_OVERRIDES.get(stage["name"], {}):
+                stage["num_iterations"] = int(
+                    _BACKPROP_OVERRIDES[stage["name"]]["--num-iterations"])
+
 STAGE_BY_NAME = {s["name"]: s for s in STAGES}
 
 

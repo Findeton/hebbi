@@ -365,13 +365,13 @@ def det_train_step(model, pos_ids, neg_ids, layer_opts, config,
 # Backprop baseline training step (for comparison)
 # ---------------------------------------------------------------------------
 
-def backprop_train_step(model, pos_ids, layer_opts, config):
+def backprop_train_step(model, pos_ids, layer_opts, config, grad_accum=1):
     """
     Standard backprop training step — gradients flow through all blocks.
 
-    Uses a single optimizer over all parameters. This exists purely as a
-    baseline to measure whether the DET architecture itself can learn,
-    independently of whether FF local learning is effective.
+    Handles its own gradient accumulation internally: call once per
+    training step with the full grad_accum count. This ensures gradients
+    are properly accumulated and the optimizer steps once per step.
 
     Uses the same LayerOptimizers for convenience but steps all at once.
     """
@@ -385,7 +385,7 @@ def backprop_train_step(model, pos_ids, layer_opts, config):
     # Forward through blocks without detaching (gradients flow everywhere)
     x, _ = model.forward_blocks(x, cos_sin, return_goodness=False)
 
-    # LM loss
+    # LM loss — scale by grad_accum so accumulated gradients have correct magnitude
     logits = model.lm_head(norm(x)).float()
     targets = pos_ids[:, 1:]
     lm_loss = F.cross_entropy(
@@ -393,9 +393,14 @@ def backprop_train_step(model, pos_ids, layer_opts, config):
         targets.reshape(-1),
     )
 
-    lm_loss.backward()
+    (lm_loss / grad_accum).backward()
 
-    # Clip and step all optimizers (blocks + head)
+    losses["lm_loss"] = lm_loss.item()
+    return losses
+
+
+def backprop_step_optimizers(model, layer_opts):
+    """Clip and step all optimizers after gradient accumulation is complete."""
     all_params = list(model.parameters())
     torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
     for i in range(len(model.blocks)):

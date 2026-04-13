@@ -28,6 +28,7 @@ from hebbi.local_learning import (
     generate_negatives_predictive,
     det_train_step,
     backprop_train_step,
+    backprop_step_optimizers,
     LayerOptimizers,
     AdaptiveThreshold,
 )
@@ -274,25 +275,33 @@ for step in range(start_step, args.num_iterations + 1):
 
     # Gradient accumulation
     accum_losses = {}
-    for micro_step in range(args.grad_accum):
-        batch = next(train_loader)
-        x = batch[0]  # works for both (x, y) and (x, y, mask) tuples
 
-        if args.backprop:
-            losses = backprop_train_step(model, x, layer_opts, config)
-        else:
+    if args.backprop:
+        # Backprop: accumulate gradients across micro-steps, step once
+        layer_opts.zero_all()
+        for micro_step in range(args.grad_accum):
+            batch = next(train_loader)
+            x = batch[0]
+            losses = backprop_train_step(model, x, layer_opts, config,
+                                         grad_accum=args.grad_accum)
+            tokens_processed += x.numel()
+            for k, v in losses.items():
+                accum_losses[k] = accum_losses.get(k, 0.0) + v / args.grad_accum
+        backprop_step_optimizers(model, layer_opts)
+    else:
+        # FF: each micro-step does its own per-block optimizer steps
+        for micro_step in range(args.grad_accum):
+            batch = next(train_loader)
+            x = batch[0]
             if args.predictive_negatives and not is_char:
                 neg_ids = generate_negatives_predictive(model, x, config.corruption_rate, neg_rng)
             else:
                 neg_ids = generate_negatives(x, config.vocab_size, config.corruption_rate, neg_rng)
             losses = det_train_step(model, x, neg_ids, layer_opts, config,
                                     adaptive_threshold=adapt_thresh)
-
-        tokens_processed += x.numel()
-
-        # Accumulate loss values for logging
-        for k, v in losses.items():
-            accum_losses[k] = accum_losses.get(k, 0.0) + v / args.grad_accum
+            tokens_processed += x.numel()
+            for k, v in losses.items():
+                accum_losses[k] = accum_losses.get(k, 0.0) + v / args.grad_accum
 
     dt = time.time() - t0
 
