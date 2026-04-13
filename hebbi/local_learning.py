@@ -210,10 +210,12 @@ class LayerOptimizers:
             )
             self.block_optimizers.append(opt)
 
-        # Head optimizer: embedding + LM head (+ memory if present)
+        # Head optimizer: embedding + LM head + pass embeddings + halt head (+ memory if present)
         head_params = [
             {"params": list(model.wte.parameters()), "lr": embed_lr},
             {"params": list(model.lm_head.parameters()), "lr": head_lr},
+            {"params": list(model.pass_embeddings.parameters()), "lr": head_lr},
+            {"params": list(model.halt_head.parameters()), "lr": head_lr},
         ]
         if model.config.n_mem > 0 and hasattr(model, "memory"):
             head_params.append({"params": [model.memory], "lr": head_lr})
@@ -447,7 +449,7 @@ def compute_energy_weights(energy_steps, mode="increasing", custom_weights=None)
 
 
 def det_train_step_with_energy(model, pos_ids, neg_ids, layer_opts, config,
-                                energy_weights):
+                                energy_weights, halt_loss_weight=0.0):
     """
     Forward-Forward training with recurrent energy dynamics.
 
@@ -465,6 +467,7 @@ def det_train_step_with_energy(model, pos_ids, neg_ids, layer_opts, config,
         config: DETConfig
         energy_weights: list of E floats — per-stage gradient weights (should
                         be normalized so sum ≈ 1.0)
+        halt_loss_weight: weight for halt head BCE loss (0=disable)
     """
     layer_opts.zero_all()
     losses = {}
@@ -478,9 +481,19 @@ def det_train_step_with_energy(model, pos_ids, neg_ids, layer_opts, config,
         x_neg = norm(model.wte(neg_ids).to(COMPUTE_DTYPE))
     cos_sin = model._get_cos_sin(pos_ids.size(1))
 
+    halt_losses = []
     for e in range(E):
         w_e = energy_weights[e]
         x_pos_prev = x_pos
+
+        # Add pass embedding so blocks know which iteration this is
+        with torch.no_grad():
+            pass_emb = model.pass_embeddings(
+                torch.tensor(e, device=pos_ids.device)
+            )
+            x_pos = x_pos + pass_emb
+            x_neg = x_neg + pass_emb
+
         history_pos = [x_pos]
         history_neg = [x_neg]
 
@@ -525,6 +538,16 @@ def det_train_step_with_energy(model, pos_ids, neg_ids, layer_opts, config,
                 delta = (x_pos - x_pos_prev).square().mean().item()
                 losses[f"energy_delta_e{e}"] = delta
 
+        # Halt loss: teach halt head when to stop (per energy pass)
+        # Target: 0 for intermediate passes, 1 for the final pass
+        if halt_loss_weight > 0:
+            halt_logits = model.halt_head(x_pos)  # (B, T, 1)
+            is_final = 1.0 if e == E - 1 else 0.0
+            halt_target = torch.full_like(halt_logits, is_final)
+            halt_losses.append(
+                F.binary_cross_entropy_with_logits(halt_logits, halt_target)
+            )
+
     # --- Single optimizer step per block, AFTER all energy stages ---
     for i, block in enumerate(model.blocks):
         torch.nn.utils.clip_grad_norm_(block.parameters(), max_norm=1.0)
@@ -547,6 +570,10 @@ def det_train_step_with_energy(model, pos_ids, neg_ids, layer_opts, config,
     )
 
     total_head_loss = lm_loss + 0.1 * emb_loss
+    if halt_losses:
+        halt_loss_val = sum(halt_losses) / len(halt_losses)
+        total_head_loss = total_head_loss + halt_loss_weight * halt_loss_val
+        losses["halt_loss"] = halt_loss_val.item()
     total_head_loss.backward()
     head_params = []
     for group in layer_opts.head_optimizer.param_groups:

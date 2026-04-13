@@ -33,6 +33,7 @@ class DETConfig:
     ff_threshold: float = 2.0   # Forward-Forward goodness threshold
     energy_steps: int = 1       # max recurrent thinking iterations
     energy_threshold: float = 0.01  # convergence threshold for early stopping (0 = always run all steps)
+    max_energy_steps: int = 8   # max supported energy passes (for pass embeddings)
     n_mem: int = 0              # GradMem prefix tokens, 0 = disabled (Phase 2)
     corruption_rate: float = 0.15  # fraction of tokens corrupted for negatives
 
@@ -335,6 +336,18 @@ class DET(nn.Module):
         )
         self.lm_head = Linear(config.n_embd, config.vocab_size, bias=False)
 
+        # Pass embeddings: tell blocks which energy iteration they're on.
+        # Zero-initialized → no effect until energy training (backward compatible).
+        self.pass_embeddings = nn.Embedding(config.max_energy_steps, config.n_embd)
+        nn.init.zeros_(self.pass_embeddings.weight)
+
+        # Learned halt head: per-token probability of stopping at this energy pass.
+        # Bias initialized positive → sigmoid > 0.5 → default is "halt after 1 pass"
+        # (backward compatible: old checkpoints without this halt early = same behavior).
+        self.halt_head = nn.Linear(config.n_embd, 1)
+        nn.init.zeros_(self.halt_head.weight)
+        nn.init.constant_(self.halt_head.bias, 2.0)  # sigmoid(2) ≈ 0.88 → halt early
+
         # GradMem: learnable prefix memory tokens (Phase 2)
         if config.n_mem > 0:
             self.memory = nn.Parameter(
@@ -470,19 +483,35 @@ class DET(nn.Module):
         # Easy inputs converge in one pass, hard inputs need more.
         self._last_energy_iters = 0
         self._last_energy_delta = 0.0
+        self._last_halt_prob = 0.0
         for energy_iter in range(self.config.energy_steps):
+            # Add pass embedding so blocks know which iteration this is
+            pass_emb = self.pass_embeddings(
+                torch.tensor(energy_iter, device=x.device)
+            )
+            x = x + pass_emb  # (B, T, D) + (D,) broadcasts
+
             x_prev = x
             x, _ = self.forward_blocks(x, cos_sin, return_goodness=False)
             self._last_energy_iters = energy_iter + 1
 
-            # Convergence check: stop when representation has settled.
-            # Only during inference — training always runs all steps for
-            # consistent gradient accumulation.
-            if energy_iter > 0 and self.config.energy_threshold > 0:
-                delta = (x - x_prev).square().mean().item()
-                self._last_energy_delta = delta
-                if not self.training and delta < self.config.energy_threshold:
+            # Learned halting: per-token probability of stopping.
+            # During inference, halt when average p_halt > 0.5.
+            # During training, the halt head gets gradients via halt_loss
+            # in train_energy.py — here we just check for early stopping.
+            if energy_iter > 0 and not self.training:
+                halt_logits = self.halt_head(x)  # (B, T, 1)
+                p_halt = torch.sigmoid(halt_logits).mean().item()
+                self._last_halt_prob = p_halt
+                if p_halt > 0.5:
                     break
+
+                # Fallback: MSE delta check (if halt head isn't trained yet)
+                if self.config.energy_threshold > 0:
+                    delta = (x - x_prev).square().mean().item()
+                    self._last_energy_delta = delta
+                    if delta < self.config.energy_threshold:
+                        break
 
         # Remove memory prefix
         if self.config.n_mem > 0 and hasattr(self, "memory"):

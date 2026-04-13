@@ -23,6 +23,7 @@ output of pass E should be a useful input for pass E+1.
 import os
 import time
 import json
+import random
 import argparse
 from dataclasses import asdict
 
@@ -61,6 +62,13 @@ parser.add_argument("--energy-weights-custom", type=str, default="",
                     help="comma-separated custom weights (required when mode=custom)")
 parser.add_argument("--energy-threshold", type=float, default=0.01,
                     help="convergence threshold for dynamic stopping at inference (0=always run all steps)")
+parser.add_argument("--progressive-ratio", type=float, default=0.3,
+                    help="fraction of training to ramp energy_steps from 1 to max (0=disabled)")
+parser.add_argument("--variable-depth", action="store_true", default=True,
+                    help="randomly sample energy_steps per batch (within current progressive limit)")
+parser.add_argument("--no-variable-depth", dest="variable_depth", action="store_false")
+parser.add_argument("--halt-loss-weight", type=float, default=0.1,
+                    help="weight of halt regularization loss (0=disable learned halting)")
 # Training
 parser.add_argument("--batch-size", type=int, default=4)
 parser.add_argument("--num-iterations", type=int, default=2000)
@@ -155,9 +163,15 @@ neg_rng.manual_seed(1337)
 if args.backprop:
     print0("Mode: BACKPROP (baseline)")
 print0(f"\nEnergy consolidation for {args.num_iterations} steps...")
-print0(f"Each step: {args.energy_steps} passes through block stack, "
+print0(f"Max energy steps: {args.energy_steps} | "
+       f"Progressive ramp: {args.progressive_ratio:.0%} | "
+       f"Variable depth: {args.variable_depth} | "
+       f"Halt loss: {args.halt_loss_weight}")
+print0(f"Each step: up to {args.energy_steps} passes through block stack, "
        f"one optimizer step at the end")
 print0()
+
+random.seed(1337)  # for variable-depth sampling
 
 smooth_lm = 0.0
 smooth_ff = 0.0
@@ -180,11 +194,27 @@ for step in range(args.num_iterations + 1):
         # Report convergence diagnostics from the last forward pass
         iters = getattr(model, "_last_energy_iters", config.energy_steps)
         delta = getattr(model, "_last_energy_delta", 0.0)
-        print0(f"--- energy: {iters}/{config.energy_steps} iters, delta={delta:.6f}, threshold={config.energy_threshold}")
+        halt_p = getattr(model, "_last_halt_prob", 0.0)
+        print0(f"--- energy: {iters}/{config.energy_steps} iters, delta={delta:.6f}, "
+               f"halt_prob={halt_p:.3f}, threshold={config.energy_threshold}")
         model.train()
 
     if last_step:
         break
+
+    # --- Compute current energy steps (progressive schedule + variable depth) ---
+    E_max = args.energy_steps
+    # Progressive: ramp from 1 to E_max over the first progressive_ratio of training
+    if args.progressive_ratio > 0:
+        ramp_steps = int(args.progressive_ratio * args.num_iterations)
+        E_limit = 1 + int((E_max - 1) * min(1.0, step / max(ramp_steps, 1)))
+    else:
+        E_limit = E_max
+    # Variable depth: sample E ~ Uniform(1, E_limit) per batch
+    if args.variable_depth and E_limit > 1:
+        E_this = random.randint(1, E_limit)
+    else:
+        E_this = E_limit
 
     # --- Training step ---
     t0 = time.time()
@@ -200,25 +230,56 @@ for step in range(args.num_iterations + 1):
         x_emb = norm(model.wte(x).to(COMPUTE_DTYPE))
         cos_sin = model._get_cos_sin(x.size(1))
         h = x_emb
-        for e in range(args.energy_steps):
+        halt_losses = []
+        for e in range(E_this):
+            # Pass embedding: tell blocks which iteration this is
+            pass_emb = model.pass_embeddings(
+                torch.tensor(e, device=x.device)
+            )
+            h = h + pass_emb
             h, _ = model.forward_blocks(h, cos_sin, return_goodness=False)
+
+            # Halt loss: teach halt head to predict "should I stop here?"
+            # Target: halt=0 for intermediate passes, halt=1 for final pass
+            if args.halt_loss_weight > 0:
+                halt_logits = model.halt_head(h)  # (B, T, 1)
+                is_final = 1.0 if e == E_this - 1 else 0.0
+                halt_target = torch.full_like(halt_logits, is_final)
+                halt_losses.append(
+                    F.binary_cross_entropy_with_logits(halt_logits, halt_target)
+                )
+
         logits = model.lm_head(norm(h)).float()
         lm_loss = F.cross_entropy(
             logits[:, :-1].reshape(-1, config.vocab_size),
             x[:, 1:].reshape(-1),
         )
-        lm_loss.backward()
+        total_loss = lm_loss
+        if halt_losses:
+            halt_loss = sum(halt_losses) / len(halt_losses)
+            total_loss = total_loss + args.halt_loss_weight * halt_loss
+        total_loss.backward()
         all_params = list(model.parameters())
         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
         for i in range(len(model.blocks)):
             layer_opts.step_block(i)
         layer_opts.step_head()
-        losses = {"lm_loss": lm_loss.item()}
+        losses = {"lm_loss": lm_loss.item(), "E_this": E_this, "E_limit": E_limit}
+        if halt_losses:
+            losses["halt_loss"] = halt_loss.item()
     else:
+        # Recompute energy weights for variable E_this
+        if E_this != len(energy_weights):
+            ew = compute_energy_weights(E_this, mode=args.energy_weight_mode)
+        else:
+            ew = energy_weights
         neg_ids = generate_negatives(x, config.vocab_size, config.corruption_rate, neg_rng)
         losses = det_train_step_with_energy(
-            model, x, neg_ids, layer_opts, config, energy_weights
+            model, x, neg_ids, layer_opts, config, ew,
+            halt_loss_weight=args.halt_loss_weight,
         )
+        losses["E_this"] = E_this
+        losses["E_limit"] = E_limit
 
     tokens_processed += x.numel()
     dt = time.time() - t0
@@ -239,9 +300,11 @@ for step in range(args.num_iterations + 1):
         actual_lr = layer_opts.block_optimizers[0].param_groups[0]["lr"]
 
         if args.backprop:
+            halt_str = f" | halt: {losses['halt_loss']:.3f}" if "halt_loss" in losses else ""
             print0(
                 f"step {step:05d}/{args.num_iterations} | "
                 f"lm: {debiased_lm:.3f} | "
+                f"E: {E_this}/{E_limit}{halt_str} | "
                 f"lr: {actual_lr:.2e} | dt: {dt*1000:.0f}ms | "
                 f"tok/s: {toks_per_sec:.0f}"
             )
@@ -253,9 +316,11 @@ for step in range(args.num_iterations + 1):
                             if k.startswith("goodness_neg_") and "_e" not in k
                             ) / config.n_layer
             per_stage = []
-            E = args.energy_steps
-            for e in range(E):
-                stage_ff = sum(losses[f"ff_{i}_e{e}"] for i in range(config.n_layer)) / config.n_layer
+            for e in range(E_this):
+                ff_key = f"ff_0_e{e}"
+                if ff_key not in losses:
+                    break
+                stage_ff = sum(losses.get(f"ff_{i}_e{e}", 0) for i in range(config.n_layer)) / config.n_layer
                 parts = [f"e{e}: ff={stage_ff:.3f}"]
                 if f"lm_loss_e{e}" in losses:
                     parts.append(f"lm={losses[f'lm_loss_e{e}']:.3f}")
@@ -263,10 +328,12 @@ for step in range(args.num_iterations + 1):
                     parts.append(f"d={losses[f'energy_delta_e{e}']:.4f}")
                 per_stage.append(" ".join(parts))
             stage_str = " | ".join(per_stage)
+            halt_str = f" | halt: {losses['halt_loss']:.3f}" if "halt_loss" in losses else ""
             print0(
                 f"step {step:05d}/{args.num_iterations} | "
                 f"lm: {debiased_lm:.3f} | ff: {debiased_ff:.3f} [{stage_str}] | "
                 f"g+: {g_pos_avg:.2f} g-: {g_neg_avg:.2f} | "
+                f"E: {E_this}/{E_limit}{halt_str} | "
                 f"lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | "
                 f"tok/s: {toks_per_sec:.0f}"
             )
