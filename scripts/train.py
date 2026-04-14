@@ -80,6 +80,8 @@ parser.add_argument("--sample-every", type=int, default=500, help="sample freque
 parser.add_argument("--save-every", type=int, default=1000, help="checkpoint frequency (-1=only end)")
 # Resume
 parser.add_argument("--resume", type=str, default="", help="path to checkpoint to resume from")
+parser.add_argument("--reset-step", action="store_true",
+                    help="reset step counter to 0 when resuming (fresh LR schedule, keep weights)")
 # Compile
 parser.add_argument("--compile", action="store_true", help="use torch.compile (requires PyTorch 2.0+)")
 # Baseline
@@ -133,6 +135,9 @@ if args.resume:
     model = DET(config).to(device)
     model.load_state_dict(checkpoint["model"], strict=False)
     start_step = checkpoint.get("step", 0)
+    if args.reset_step:
+        print0(f"Resetting step counter from {start_step} to 0 (fresh LR schedule)")
+        start_step = 0
     # CLI flags override checkpoint state for these features
     # (so you can enable them mid-training by adding the flag on resume)
     if args.adaptive_threshold:

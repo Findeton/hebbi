@@ -189,8 +189,8 @@ if pipeline_args.backprop:
     _BACKPROP_OVERRIDES = {
         "tinystories":  {"--num-iterations": "4000",  "--save-every": "500",
                          "--sample-every": "500",  "--warmup-steps": "200"},
-        "climbmix":     {"--num-iterations": "10000", "--save-every": "500",
-                         "--sample-every": "1000", "--warmup-steps": "300"},
+        "climbmix":     {"--num-iterations": "40000", "--save-every": "500",
+                         "--sample-every": "500", "--warmup-steps": "1000"},
         "sft":          {"--num-iterations": "600",   "--save-every": "200",
                          "--sample-every": "200",  "--warmup-steps": "10"},
         "energy":       {"--num-iterations": "400",   "--save-every": "200",
