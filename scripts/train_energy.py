@@ -277,13 +277,17 @@ for step in range(args.num_iterations + 1):
                     )
                 teacher_logits = model.lm_head(norm(h_t)).float()
 
-            student_log_probs = F.log_softmax(logits[:, :-1], dim=-1)
-            teacher_probs = F.softmax(teacher_logits[:, :-1], dim=-1)
-            ilsd_loss = F.kl_div(
-                student_log_probs.reshape(-1, config.vocab_size),
-                teacher_probs.reshape(-1, config.vocab_size),
-                reduction="batchmean",
-            )
+            # Chunked KL to avoid OOM on smaller GPUs (T4 etc.)
+            _chunk = 64
+            _T = logits.size(1) - 1
+            _kl_sum = torch.tensor(0.0, device=x.device)
+            for _i in range(0, _T, _chunk):
+                _j = min(_i + _chunk, _T)
+                _s = F.log_softmax(logits[:, _i:_j], dim=-1)
+                _t = F.softmax(teacher_logits[:, _i:_j], dim=-1).detach()
+                _kl_sum = _kl_sum + F.kl_div(_s, _t, reduction="sum")
+            del teacher_logits
+            ilsd_loss = _kl_sum / (logits.size(0) * _T)
             total_loss = total_loss + args.ilsd_weight * ilsd_loss
 
         total_loss.backward()

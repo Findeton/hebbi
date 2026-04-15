@@ -599,13 +599,17 @@ def det_train_step_with_energy(model, pos_ids, neg_ids, layer_opts, config,
                 x_t, _ = model.forward_blocks(x_t, cos_sin, return_goodness=False)
             teacher_logits = model.lm_head(norm(x_t)).float()
 
-        student_log_probs = F.log_softmax(logits[:, :-1], dim=-1)
-        teacher_probs = F.softmax(teacher_logits[:, :-1], dim=-1)
-        ilsd_loss_val = F.kl_div(
-            student_log_probs.reshape(-1, config.vocab_size),
-            teacher_probs.reshape(-1, config.vocab_size),
-            reduction="batchmean",
-        )
+        # Chunked KL to avoid OOM on smaller GPUs (T4 etc.)
+        _chunk = 64
+        _T = logits.size(1) - 1
+        _kl_sum = torch.tensor(0.0, device=pos_ids.device)
+        for _i in range(0, _T, _chunk):
+            _j = min(_i + _chunk, _T)
+            _s = F.log_softmax(logits[:, _i:_j], dim=-1)
+            _t = F.softmax(teacher_logits[:, _i:_j], dim=-1).detach()
+            _kl_sum = _kl_sum + F.kl_div(_s, _t, reduction="sum")
+        del teacher_logits
+        ilsd_loss_val = _kl_sum / (logits.size(0) * _T)
         total_head_loss = total_head_loss + ilsd_weight * ilsd_loss_val
         losses["ilsd_loss"] = ilsd_loss_val.item()
 
