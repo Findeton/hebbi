@@ -151,6 +151,7 @@ STAGES = [
             "--num-iterations=2000",
             "--energy-steps=3",
             "--energy-weight-mode=increasing",
+            "--ilsd-weight=0.3",
             "--block-lr=1e-4",
             "--head-lr=1e-4",
             "--embed-lr=3e-4",

@@ -449,7 +449,8 @@ def compute_energy_weights(energy_steps, mode="increasing", custom_weights=None)
 
 
 def det_train_step_with_energy(model, pos_ids, neg_ids, layer_opts, config,
-                                energy_weights, halt_loss_weight=0.0):
+                                energy_weights, halt_loss_weight=0.0,
+                                ilsd_weight=0.0, teacher_energy_steps=0):
     """
     Forward-Forward training with recurrent energy dynamics.
 
@@ -468,6 +469,14 @@ def det_train_step_with_energy(model, pos_ids, neg_ids, layer_opts, config,
         energy_weights: list of E floats — per-stage gradient weights (should
                         be normalized so sum ≈ 1.0)
         halt_loss_weight: weight for halt head BCE loss (0=disable)
+        ilsd_weight: weight for Intra-Loop Self Distillation KL loss (0=disable).
+                     When > 0 and teacher_energy_steps > E, a teacher forward with
+                     teacher_energy_steps passes (no grad) produces soft targets
+                     that the student (current E passes) distills from. Only the
+                     LM head/embedding receive this gradient in FF mode because
+                     block outputs are detached by the per-block local learning.
+        teacher_energy_steps: number of passes for the teacher (0 = same as
+                              student; disables ILSD).
     """
     layer_opts.zero_all()
     losses = {}
@@ -574,6 +583,32 @@ def det_train_step_with_energy(model, pos_ids, neg_ids, layer_opts, config,
         halt_loss_val = sum(halt_losses) / len(halt_losses)
         total_head_loss = total_head_loss + halt_loss_weight * halt_loss_val
         losses["halt_loss"] = halt_loss_val.item()
+
+    # --- ILSD: Intra-Loop Self Distillation ---
+    # Teacher runs more passes (no grad), student distills its final logits.
+    # Only active when ilsd_weight > 0 AND the teacher would run more passes
+    # than the student actually ran this step.
+    if ilsd_weight > 0 and teacher_energy_steps > E:
+        with torch.no_grad():
+            x_t = norm(model.wte(pos_ids).to(COMPUTE_DTYPE))
+            for e_t in range(teacher_energy_steps):
+                pass_emb_t = model.pass_embeddings(
+                    torch.tensor(e_t, device=pos_ids.device)
+                )
+                x_t = x_t + pass_emb_t
+                x_t, _ = model.forward_blocks(x_t, cos_sin, return_goodness=False)
+            teacher_logits = model.lm_head(norm(x_t)).float()
+
+        student_log_probs = F.log_softmax(logits[:, :-1], dim=-1)
+        teacher_probs = F.softmax(teacher_logits[:, :-1], dim=-1)
+        ilsd_loss_val = F.kl_div(
+            student_log_probs.reshape(-1, config.vocab_size),
+            teacher_probs.reshape(-1, config.vocab_size),
+            reduction="batchmean",
+        )
+        total_head_loss = total_head_loss + ilsd_weight * ilsd_loss_val
+        losses["ilsd_loss"] = ilsd_loss_val.item()
+
     total_head_loss.backward()
     head_params = []
     for group in layer_opts.head_optimizer.param_groups:

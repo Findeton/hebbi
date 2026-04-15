@@ -69,6 +69,9 @@ parser.add_argument("--variable-depth", action="store_true", default=True,
 parser.add_argument("--no-variable-depth", dest="variable_depth", action="store_false")
 parser.add_argument("--halt-loss-weight", type=float, default=0.1,
                     help="weight of halt regularization loss (0=disable learned halting)")
+parser.add_argument("--ilsd-weight", type=float, default=0.0,
+                    help="weight of Intra-Loop Self Distillation KL loss "
+                         "(0=disable, backward compatible default)")
 # Training
 parser.add_argument("--batch-size", type=int, default=4)
 parser.add_argument("--num-iterations", type=int, default=2000)
@@ -258,6 +261,31 @@ for step in range(args.num_iterations + 1):
         if halt_losses:
             halt_loss = sum(halt_losses) / len(halt_losses)
             total_loss = total_loss + args.halt_loss_weight * halt_loss
+
+        # --- ILSD: teacher with full E_max (no grad), student with E_this ---
+        ilsd_loss = None
+        if args.ilsd_weight > 0 and args.energy_steps > E_this:
+            with torch.no_grad():
+                h_t = norm(model.wte(x).to(COMPUTE_DTYPE))
+                for e_t in range(args.energy_steps):
+                    pass_emb_t = model.pass_embeddings(
+                        torch.tensor(e_t, device=x.device)
+                    )
+                    h_t = h_t + pass_emb_t
+                    h_t, _ = model.forward_blocks(
+                        h_t, cos_sin, return_goodness=False
+                    )
+                teacher_logits = model.lm_head(norm(h_t)).float()
+
+            student_log_probs = F.log_softmax(logits[:, :-1], dim=-1)
+            teacher_probs = F.softmax(teacher_logits[:, :-1], dim=-1)
+            ilsd_loss = F.kl_div(
+                student_log_probs.reshape(-1, config.vocab_size),
+                teacher_probs.reshape(-1, config.vocab_size),
+                reduction="batchmean",
+            )
+            total_loss = total_loss + args.ilsd_weight * ilsd_loss
+
         total_loss.backward()
         all_params = list(model.parameters())
         torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
@@ -267,6 +295,8 @@ for step in range(args.num_iterations + 1):
         losses = {"lm_loss": lm_loss.item(), "E_this": E_this, "E_limit": E_limit}
         if halt_losses:
             losses["halt_loss"] = halt_loss.item()
+        if ilsd_loss is not None:
+            losses["ilsd_loss"] = ilsd_loss.item()
     else:
         # Recompute energy weights for variable E_this
         if E_this != len(energy_weights):
@@ -277,6 +307,8 @@ for step in range(args.num_iterations + 1):
         losses = det_train_step_with_energy(
             model, x, neg_ids, layer_opts, config, ew,
             halt_loss_weight=args.halt_loss_weight,
+            ilsd_weight=args.ilsd_weight,
+            teacher_energy_steps=args.energy_steps,
         )
         losses["E_this"] = E_this
         losses["E_limit"] = E_limit
