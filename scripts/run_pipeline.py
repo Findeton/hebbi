@@ -195,7 +195,8 @@ if pipeline_args.backprop:
         "sft":          {"--num-iterations": "600",   "--save-every": "200",
                          "--sample-every": "200",  "--warmup-steps": "10"},
         "energy":       {"--num-iterations": "400",   "--save-every": "200",
-                         "--sample-every": "200",  "--warmup-steps": "20"},
+                         "--sample-every": "200",  "--warmup-steps": "20",
+                         "--batch-size": "2"},
         "memory":       {"--num-iterations": "200",   "--save-every": "100",
                          "--sample-every": "100",  "--warmup-steps": "10"},
     }
