@@ -235,18 +235,24 @@ for step in range(args.num_iterations + 1):
     # --- Sample ---
     if args.sample_every > 0 and (last_step or (step > 0 and step % args.sample_every == 0)):
         model.eval()
-        # Generate a chat-style response
-        prompt_text = "What is the meaning of life?"
-        prompt_ids = (
-            [tokenizer.bos_id, tokenizer.user_start_id]
-            + tokenizer.encode(prompt_text)
-            + [tokenizer.user_end_id, tokenizer.assistant_start_id]
-        )
-        gen = list(model.generate(prompt_ids, max_tokens=200, temperature=0.8, top_k=40))
-        response = tokenizer.decode(gen)
-        print0(f"--- sample @ step {step} ---")
-        print0(f"User: {prompt_text}")
-        print0(f"Assistant: {response[:400]}")
+        # Generate chat-style responses from multiple prompts
+        sample_prompts = [
+            "What is the meaning of life?",
+            "Explain how computers work in simple terms.",
+            "Tell me a short story about a dog.",
+        ]
+        print0(f"--- samples @ step {step} ---")
+        for prompt_text in sample_prompts:
+            prompt_ids = (
+                [tokenizer.bos_id, tokenizer.user_start_id]
+                + tokenizer.encode(prompt_text)
+                + [tokenizer.user_end_id, tokenizer.assistant_start_id]
+            )
+            gen = list(model.generate(prompt_ids, max_tokens=150, temperature=0.8, top_k=40))
+            response = tokenizer.decode(gen)
+            print0(f"User: {prompt_text}")
+            print0(f"Assistant: {response[:300]}")
+            print0()
         print0("---")
         model.train()
 
