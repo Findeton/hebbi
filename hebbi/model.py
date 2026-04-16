@@ -530,8 +530,9 @@ class DET(nn.Module):
         return logits
 
     @torch.inference_mode()
-    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
-        """Naive autoregressive generation (same pattern as nanochat)."""
+    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42,
+                 repetition_penalty=1.2, rep_window=64):
+        """Autoregressive generation with repetition penalty."""
         assert isinstance(tokens, list)
         device = self.wte.weight.device
         rng = None
@@ -543,6 +544,14 @@ class DET(nn.Module):
             ids_cond = ids[:, -self.config.sequence_len :]
             logits = self.forward(ids_cond)
             logits = logits[:, -1, :]
+            # Repetition penalty: reduce logits for tokens in recent window
+            if repetition_penalty != 1.0:
+                recent = ids[0, -rep_window:].tolist()
+                for tok_id in set(recent):
+                    if logits[0, tok_id] > 0:
+                        logits[0, tok_id] /= repetition_penalty
+                    else:
+                        logits[0, tok_id] *= repetition_penalty
             if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float("Inf")
