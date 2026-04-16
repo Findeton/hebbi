@@ -45,6 +45,9 @@ from pathlib import Path
 pipeline_parser = argparse.ArgumentParser(description="Hebbi training pipeline")
 pipeline_parser.add_argument("--backprop", action="store_true",
                              help="use standard backprop instead of FF (baseline)")
+pipeline_parser.add_argument("--restart-from", type=str, default=None,
+                             choices=["tinystories", "climbmix", "sft", "energy", "memory"],
+                             help="restart pipeline from this stage (clears it and all later stages)")
 pipeline_args = pipeline_parser.parse_args()
 
 
@@ -192,8 +195,8 @@ if pipeline_args.backprop:
                          "--sample-every": "500",  "--warmup-steps": "200"},
         "climbmix":     {"--num-iterations": "40000", "--save-every": "500",
                          "--sample-every": "500", "--warmup-steps": "1000"},
-        "sft":          {"--num-iterations": "600",   "--save-every": "200",
-                         "--sample-every": "200",  "--warmup-steps": "10"},
+        "sft":          {"--num-iterations": "3000",  "--save-every": "500",
+                         "--sample-every": "500",  "--warmup-steps": "50"},
         "energy":       {"--num-iterations": "400",   "--save-every": "200",
                          "--sample-every": "200",  "--warmup-steps": "20",
                          "--batch-size": "2"},
@@ -394,6 +397,38 @@ def run_stage(stage):
 def main():
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     state = load_state()
+
+    # --restart-from: clear this stage and all later stages so they re-run
+    if pipeline_args.restart_from is not None:
+        restart = pipeline_args.restart_from
+        stage_names = [s["name"] for s in STAGES]
+        if restart not in stage_names:
+            log(f"Unknown stage: {restart}")
+            sys.exit(1)
+        restart_idx = stage_names.index(restart)
+        stages_to_clear = stage_names[restart_idx:]
+        cleared = []
+        for sname in stages_to_clear:
+            if sname in state["completed"]:
+                state["completed"].remove(sname)
+                cleared.append(sname)
+            # Remove old checkpoints so the stage starts fresh from prev stage
+            sd = stage_dir(sname)
+            ckpt_d = stage_ckpt_dir(sname)
+            if ckpt_d.exists():
+                import shutil
+                shutil.rmtree(ckpt_d)
+                log(f"Cleared checkpoints: {ckpt_d}")
+            # Also remove init_from_prev.pt so it gets re-created
+            init_ckpt = sd / "init_from_prev.pt"
+            if init_ckpt.exists():
+                init_ckpt.unlink()
+        save_state(state)
+        if cleared:
+            log(f"Restarting from {restart}: cleared {cleared}")
+        else:
+            log(f"Restarting from {restart} (none were marked complete)")
+
     log(f"Runs dir: {RUNS_DIR}")
     log(f"State: {state}")
     print()
