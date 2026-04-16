@@ -300,6 +300,116 @@ def sft_data_loader(dataset_name, tokenizer, batch_size, seq_len, device,
 
 
 # ---------------------------------------------------------------------------
+# Memory training data loader — yields (context, target) pairs from
+# split conversations so memory banks get relevant content to store.
+# ---------------------------------------------------------------------------
+
+def memory_data_loader(dataset_name, tokenizer, batch_size, seq_len, device,
+                       split="train", messages_field="messages",
+                       mode="split"):
+    """
+    Infinite iterator for memory training.
+
+    Modes:
+      - "split":  split each conversation at a turn boundary — first half
+                  becomes context (Hebbian write), second half becomes target.
+      - "replay": same conversation for both context and target.
+      - "random": unrelated context and target batches (original behavior).
+
+    Yields (context_ids, target_ids) each of shape (B, T).
+    """
+    ds = _load_hf_dataset(dataset_name, split=split)
+    ds_iter = iter(ds)
+
+    def _next_example():
+        nonlocal ds_iter
+        while True:
+            try:
+                example = next(ds_iter)
+            except StopIteration:
+                ds_iter = iter(_load_hf_dataset(dataset_name, split=split))
+                example = next(ds_iter)
+            messages = example.get(messages_field, [])
+            if messages and len(messages) >= 2:
+                return messages
+
+    def _to_tensor(ids_list):
+        """Pad/truncate a list of id lists to (B, seq_len) tensor."""
+        result = []
+        for ids in ids_list:
+            if len(ids) > seq_len:
+                ids = ids[:seq_len]
+            elif len(ids) < seq_len:
+                ids = ids + [tokenizer.eos_id] * (seq_len - len(ids))
+            result.append(ids)
+        return torch.tensor(result, dtype=torch.long, device=device)
+
+    if mode == "random":
+        # Original behavior: two independent streams
+        ctx_buf = []
+        tgt_buf = []
+        while True:
+            while len(ctx_buf) < batch_size:
+                msgs = _next_example()
+                ids, _ = tokenizer.render_conversation(msgs)
+                ctx_buf.append(ids)
+            while len(tgt_buf) < batch_size:
+                msgs = _next_example()
+                ids, _ = tokenizer.render_conversation(msgs)
+                tgt_buf.append(ids)
+            yield _to_tensor(ctx_buf[:batch_size]), _to_tensor(tgt_buf[:batch_size])
+            ctx_buf = ctx_buf[batch_size:]
+            tgt_buf = tgt_buf[batch_size:]
+
+    elif mode == "replay":
+        # Same conversation for context and target
+        buf = []
+        while True:
+            while len(buf) < batch_size:
+                msgs = _next_example()
+                ids, _ = tokenizer.render_conversation(msgs)
+                if len(ids) >= 4:
+                    buf.append(ids)
+            batch = buf[:batch_size]
+            buf = buf[batch_size:]
+            t = _to_tensor(batch)
+            yield t, t.clone()
+
+    elif mode == "split":
+        # Split each conversation at a turn boundary
+        ctx_buf = []
+        tgt_buf = []
+        while True:
+            while len(ctx_buf) < batch_size:
+                msgs = _next_example()
+                # Find a split point: half the turns (at least 1 for each half)
+                n = len(msgs)
+                # Split at the midpoint, rounding to a turn boundary
+                # Ensure at least 1 message per half
+                split_idx = max(1, n // 2)
+                ctx_msgs = msgs[:split_idx]
+                tgt_msgs = msgs[split_idx:]
+                if not tgt_msgs:
+                    # Conversation too short to split; use as replay
+                    ids, _ = tokenizer.render_conversation(msgs)
+                    if len(ids) >= 4:
+                        ctx_buf.append(ids)
+                        tgt_buf.append(ids)
+                    continue
+                ctx_ids, _ = tokenizer.render_conversation(ctx_msgs)
+                tgt_ids, _ = tokenizer.render_conversation(tgt_msgs)
+                if len(ctx_ids) >= 4 and len(tgt_ids) >= 4:
+                    ctx_buf.append(ctx_ids)
+                    tgt_buf.append(tgt_ids)
+            yield (_to_tensor(ctx_buf[:batch_size]),
+                   _to_tensor(tgt_buf[:batch_size]))
+            ctx_buf = ctx_buf[batch_size:]
+            tgt_buf = tgt_buf[batch_size:]
+    else:
+        raise ValueError(f"Unknown memory data mode: {mode}")
+
+
+# ---------------------------------------------------------------------------
 # Dataset registry
 # ---------------------------------------------------------------------------
 

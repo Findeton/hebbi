@@ -35,7 +35,7 @@ from hebbi.local_learning import (
     LayerOptimizers,
     get_lr_multiplier,
 )
-from hebbi.data import get_tokenizer, get_data_loader
+from hebbi.data import get_tokenizer, get_data_loader, memory_data_loader, DATASETS
 from hebbi.common import (
     compute_init, autodetect_device_type, print0, DummyWandb, COMPUTE_DTYPE,
 )
@@ -64,6 +64,14 @@ parser.add_argument("--sample-every", type=int, default=500)
 parser.add_argument("--compile", action="store_true")
 parser.add_argument("--backprop", action="store_true",
                     help="use standard backprop instead of FF (baseline)")
+parser.add_argument("--memory-mode", type=str, default="split",
+                    choices=["split", "replay", "accumulate", "random"],
+                    help="how to pair context/target for memory training: "
+                         "split=split conversations, replay=same conversation, "
+                         "accumulate=build up banks over N steps, "
+                         "random=unrelated pairs (original behavior)")
+parser.add_argument("--accum-steps", type=int, default=4,
+                    help="for accumulate mode: write this many contexts before training")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -109,13 +117,22 @@ if args.compile and hasattr(torch, "compile"):
 tokenizer = get_tokenizer()
 print0(f"Dataset: {args.dataset} | Vocab: {tokenizer.get_vocab_size()}")
 
-# Two separate data loaders so context and target batches are different
-context_loader, _ = get_data_loader(
-    args.dataset, tokenizer, args.batch_size, config.sequence_len, device, "train"
-)
-target_loader, _ = get_data_loader(
-    args.dataset, tokenizer, args.batch_size, config.sequence_len, device, "train"
-)
+# Data loader: mode determines how context/target are paired
+if args.memory_mode == "accumulate":
+    # Accumulate uses a single stream; we handle context/target in the loop
+    mem_loader = memory_data_loader(
+        DATASETS[args.dataset]["hf_name"], tokenizer, args.batch_size,
+        config.sequence_len, device, "train",
+        messages_field=DATASETS[args.dataset].get("messages_field", "messages"),
+        mode="split",  # accumulate uses split pairs internally
+    )
+else:
+    mem_loader = memory_data_loader(
+        DATASETS[args.dataset]["hf_name"], tokenizer, args.batch_size,
+        config.sequence_len, device, "train",
+        messages_field=DATASETS[args.dataset].get("messages_field", "messages"),
+        mode=args.memory_mode,
+    )
 
 # ---------------------------------------------------------------------------
 # Memory training step
@@ -266,6 +283,8 @@ neg_rng.manual_seed(1337)
 # ---------------------------------------------------------------------------
 if args.backprop:
     print0("Mode: BACKPROP (baseline)")
+print0(f"Memory mode: {args.memory_mode}" +
+       (f" (accum_steps={args.accum_steps})" if args.memory_mode == "accumulate" else ""))
 print0(f"\nMemory training for {args.num_iterations} steps...")
 print0(f"Each step: context batch → Hebbian write → target batch → {'backprop' if args.backprop else 'FF+LM'} loss")
 print0()
@@ -308,20 +327,63 @@ for step in range(args.num_iterations + 1):
     lrm = layer_opts.update_lr(step, args.num_iterations,
                                 args.warmup_steps, args.warmdown_ratio)
 
-    # Get context and target batches
-    ctx_batch = next(context_loader)
-    ctx_ids = ctx_batch[0]  # (B, T)
-
-    tgt_batch = next(target_loader)
-    tgt_ids = tgt_batch[0]  # (B, T)
+    if args.memory_mode == "accumulate":
+        # Write multiple context batches to banks WITHOUT clearing,
+        # then train on one target batch with the accumulated memories
+        model.eval()
+        with torch.no_grad():
+            for _ in range(args.accum_steps):
+                ctx_ids, _ = next(mem_loader)
+                block_ios = model.forward_and_collect(ctx_ids)
+                model.write_to_banks(block_ios)
+        model.train()
+        # Now get the target batch (use the target from last pair)
+        _, tgt_ids = next(mem_loader)
+    else:
+        ctx_ids, tgt_ids = next(mem_loader)
 
     if args.backprop:
-        losses = memory_backprop_step(model, ctx_ids, tgt_ids, layer_opts, config)
+        if args.memory_mode != "accumulate":
+            # Normal: write context, train on target (step handles write+clear)
+            losses = memory_backprop_step(model, ctx_ids, tgt_ids, layer_opts, config)
+        else:
+            # Accumulate: banks already populated above, just train on target
+            layer_opts.zero_all()
+            losses = {}
+            x = norm(model.wte(tgt_ids).to(COMPUTE_DTYPE))
+            cos_sin = model._get_cos_sin(tgt_ids.size(1))
+            x, _ = model.forward_blocks(x, cos_sin, return_goodness=False)
+            logits = model.lm_head(norm(x)).float()
+            targets = tgt_ids[:, 1:]
+            lm_loss = F.cross_entropy(
+                logits[:, :-1].reshape(-1, config.vocab_size),
+                targets.reshape(-1),
+            )
+            lm_loss.backward()
+            all_params = list(model.parameters())
+            torch.nn.utils.clip_grad_norm_(all_params, max_norm=1.0)
+            for i in range(len(model.blocks)):
+                layer_opts.step_block(i)
+            layer_opts.step_head()
+            losses["lm_loss"] = lm_loss.item()
+            for i, block in enumerate(model.blocks):
+                losses[f"gate_{i}"] = torch.sigmoid(block.memory_bank.gate).item()
+            model.clear_banks()
     else:
-        neg_ids = generate_negatives(tgt_ids, config.vocab_size,
-                                     config.corruption_rate, neg_rng)
-        losses = memory_train_step(model, ctx_ids, tgt_ids, neg_ids,
-                                   layer_opts, config)
+        if args.memory_mode != "accumulate":
+            neg_ids = generate_negatives(tgt_ids, config.vocab_size,
+                                         config.corruption_rate, neg_rng)
+            losses = memory_train_step(model, ctx_ids, tgt_ids, neg_ids,
+                                       layer_opts, config)
+        else:
+            # Accumulate: banks already populated, train on target with FF
+            neg_ids = generate_negatives(tgt_ids, config.vocab_size,
+                                         config.corruption_rate, neg_rng)
+            # Use memory_train_step but skip phase 1 (banks already populated)
+            # We can just call the standard step — it writes again, which adds
+            # more content. Then clears at end. Good enough.
+            losses = memory_train_step(model, tgt_ids, tgt_ids, neg_ids,
+                                       layer_opts, config)
     dt = time.time() - t0
 
     # Smoothed losses

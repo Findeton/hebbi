@@ -197,8 +197,8 @@ if pipeline_args.backprop:
         "energy":       {"--num-iterations": "400",   "--save-every": "200",
                          "--sample-every": "200",  "--warmup-steps": "20",
                          "--batch-size": "2"},
-        "memory":       {"--num-iterations": "200",   "--save-every": "100",
-                         "--sample-every": "100",  "--warmup-steps": "10"},
+        "memory":       {"--num-iterations": "500",   "--save-every": "100",
+                         "--sample-every": "100",  "--warmup-steps": "20"},
     }
     for stage in STAGES:
         overrides = _BACKPROP_OVERRIDES.get(stage["name"], {})
