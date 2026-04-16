@@ -72,6 +72,14 @@ parser.add_argument("--memory-mode", type=str, default="split",
                          "random=unrelated pairs (original behavior)")
 parser.add_argument("--accum-steps", type=int, default=4,
                     help="for accumulate mode: write this many contexts before training")
+parser.add_argument("--gate-lr", type=float, default=0.03,
+                    help="learning rate for gate parameters (higher than block-lr "
+                         "to push gates open from sigmoid(-3) init)")
+parser.add_argument("--freeze-model", action="store_true", default=True,
+                    help="freeze all params except gates during memory training "
+                         "(prevents model degradation)")
+parser.add_argument("--no-freeze-model", dest="freeze_model", action="store_false",
+                    help="train all params (original behavior, risks degradation)")
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -227,7 +235,7 @@ def memory_train_step(model, context_ids, target_pos, target_neg,
 
 def memory_backprop_step(model, context_ids, target_pos, layer_opts, config):
     """
-    Backprop memory training:
+    Backprop memory training (full model):
       1. Populate banks from context (same Hebbian write, no gradients)
       2. Full backprop forward on target with banks populated
       3. Clear banks
@@ -270,10 +278,71 @@ def memory_backprop_step(model, context_ids, target_pos, layer_opts, config):
     return losses
 
 
+def gate_only_step(model, context_ids, target_pos, gate_optimizer, config):
+    """
+    Gate-only memory training (frozen model):
+      1. Populate banks from context (Hebbian write)
+      2. Forward target with banks populated — only gate params get gradients
+      3. Step gate optimizer, clear banks
+
+    The model weights are frozen (requires_grad=False), so gradients only
+    flow to the gate parameters. This prevents model degradation while
+    giving the gates a strong learning signal.
+    """
+    # --- Phase 1: Populate memory banks from context ---
+    model.eval()
+    with torch.no_grad():
+        block_ios = model.forward_and_collect(context_ids)
+        model.write_to_banks(block_ios)
+
+    # --- Phase 2: Forward target, gradient only to gates ---
+    # Set train mode but only gates have requires_grad=True
+    model.train()
+    gate_optimizer.zero_grad()
+
+    x = norm(model.wte(target_pos).to(COMPUTE_DTYPE))
+    cos_sin = model._get_cos_sin(target_pos.size(1))
+    x, _ = model.forward_blocks(x, cos_sin, return_goodness=False)
+
+    logits = model.lm_head(norm(x)).float()
+    targets = target_pos[:, 1:]
+    lm_loss = F.cross_entropy(
+        logits[:, :-1].reshape(-1, config.vocab_size),
+        targets.reshape(-1),
+    )
+    lm_loss.backward()
+    gate_optimizer.step()
+
+    losses = {"lm_loss": lm_loss.item()}
+    for i, block in enumerate(model.blocks):
+        losses[f"gate_{i}"] = torch.sigmoid(block.memory_bank.gate).item()
+
+    # --- Phase 3: Clear banks ---
+    model.clear_banks()
+
+    return losses
+
+
 # ---------------------------------------------------------------------------
-# Optimizers
+# Optimizers — gate-only or full model
 # ---------------------------------------------------------------------------
-layer_opts = LayerOptimizers(model, args.block_lr, args.head_lr, args.embed_lr)
+if args.freeze_model:
+    # Freeze everything except gate parameters
+    for name, p in model.named_parameters():
+        if "memory_bank.gate" in name:
+            p.requires_grad_(True)
+        else:
+            p.requires_grad_(False)
+    gate_params = [b.memory_bank.gate for b in model.blocks]
+    gate_optimizer = torch.optim.AdamW(gate_params, lr=args.gate_lr,
+                                        weight_decay=0.0)
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print0(f"Frozen model: training only {n_trainable} gate params (lr={args.gate_lr})")
+    # Still need LayerOptimizers for the FF path compatibility, but it won't step
+    layer_opts = LayerOptimizers(model, args.block_lr, args.head_lr, args.embed_lr)
+else:
+    gate_optimizer = None
+    layer_opts = LayerOptimizers(model, args.block_lr, args.head_lr, args.embed_lr)
 
 neg_rng = torch.Generator(device="cpu")
 neg_rng.manual_seed(1337)
@@ -324,8 +393,14 @@ for step in range(args.num_iterations + 1):
 
     # --- Training step ---
     t0 = time.time()
-    lrm = layer_opts.update_lr(step, args.num_iterations,
+    if not args.freeze_model:
+        lrm = layer_opts.update_lr(step, args.num_iterations,
+                                    args.warmup_steps, args.warmdown_ratio)
+    else:
+        lrm = get_lr_multiplier(step, args.num_iterations,
                                 args.warmup_steps, args.warmdown_ratio)
+        for g in gate_optimizer.param_groups:
+            g["lr"] = args.gate_lr * lrm
 
     if args.memory_mode == "accumulate":
         # Write multiple context batches to banks WITHOUT clearing,
@@ -337,27 +412,44 @@ for step in range(args.num_iterations + 1):
                 block_ios = model.forward_and_collect(ctx_ids)
                 model.write_to_banks(block_ios)
         model.train()
-        # Now get the target batch (use the target from last pair)
         _, tgt_ids = next(mem_loader)
     else:
         ctx_ids, tgt_ids = next(mem_loader)
 
-    if args.backprop:
+    if args.freeze_model:
+        # Gate-only training: frozen model, only gate params get gradients
+        if args.memory_mode == "accumulate":
+            # Banks already populated, just do the forward + gate step
+            gate_optimizer.zero_grad()
+            x = norm(model.wte(tgt_ids).to(COMPUTE_DTYPE))
+            cos_sin = model._get_cos_sin(tgt_ids.size(1))
+            x, _ = model.forward_blocks(x, cos_sin, return_goodness=False)
+            logits = model.lm_head(norm(x)).float()
+            lm_loss = F.cross_entropy(
+                logits[:, :-1].reshape(-1, config.vocab_size),
+                tgt_ids[:, 1:].reshape(-1),
+            )
+            lm_loss.backward()
+            gate_optimizer.step()
+            losses = {"lm_loss": lm_loss.item()}
+            for i, block in enumerate(model.blocks):
+                losses[f"gate_{i}"] = torch.sigmoid(block.memory_bank.gate).item()
+            model.clear_banks()
+        else:
+            losses = gate_only_step(model, ctx_ids, tgt_ids, gate_optimizer, config)
+    elif args.backprop:
         if args.memory_mode != "accumulate":
-            # Normal: write context, train on target (step handles write+clear)
             losses = memory_backprop_step(model, ctx_ids, tgt_ids, layer_opts, config)
         else:
-            # Accumulate: banks already populated above, just train on target
             layer_opts.zero_all()
             losses = {}
             x = norm(model.wte(tgt_ids).to(COMPUTE_DTYPE))
             cos_sin = model._get_cos_sin(tgt_ids.size(1))
             x, _ = model.forward_blocks(x, cos_sin, return_goodness=False)
             logits = model.lm_head(norm(x)).float()
-            targets = tgt_ids[:, 1:]
             lm_loss = F.cross_entropy(
                 logits[:, :-1].reshape(-1, config.vocab_size),
-                targets.reshape(-1),
+                tgt_ids[:, 1:].reshape(-1),
             )
             lm_loss.backward()
             all_params = list(model.parameters())
@@ -376,12 +468,8 @@ for step in range(args.num_iterations + 1):
             losses = memory_train_step(model, ctx_ids, tgt_ids, neg_ids,
                                        layer_opts, config)
         else:
-            # Accumulate: banks already populated, train on target with FF
             neg_ids = generate_negatives(tgt_ids, config.vocab_size,
                                          config.corruption_rate, neg_rng)
-            # Use memory_train_step but skip phase 1 (banks already populated)
-            # We can just call the standard step — it writes again, which adds
-            # more content. Then clears at end. Good enough.
             losses = memory_train_step(model, tgt_ids, tgt_ids, neg_ids,
                                        layer_opts, config)
     dt = time.time() - t0
@@ -389,7 +477,8 @@ for step in range(args.num_iterations + 1):
     # Smoothed losses
     ema = 0.95
     lm_loss = losses["lm_loss"]
-    ff_avg = sum(v for k, v in losses.items() if k.startswith("ff_")) / config.n_layer
+    ff_keys = [v for k, v in losses.items() if k.startswith("ff_")]
+    ff_avg = sum(ff_keys) / max(len(ff_keys), 1)
     smooth_lm = ema * smooth_lm + (1 - ema) * lm_loss
     smooth_ff = ema * smooth_ff + (1 - ema) * ff_avg
     debiased_lm = smooth_lm / (1 - ema ** (step + 1))
@@ -399,7 +488,7 @@ for step in range(args.num_iterations + 1):
         gate_avg = sum(v for k, v in losses.items()
                        if k.startswith("gate_")) / config.n_layer
         elapsed = time.time() - t_start
-        if args.backprop:
+        if args.backprop or args.freeze_model:
             print0(
                 f"step {step:05d}/{args.num_iterations} | "
                 f"lm: {debiased_lm:.3f} | "
